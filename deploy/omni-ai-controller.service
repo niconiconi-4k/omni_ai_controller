@@ -1,0 +1,30 @@
+[Unit]
+Description=Omni AI host controller API
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=@PROJECT_DIR@
+EnvironmentFile=/etc/omni-ai-controller/service.env
+Environment=PYTHONUNBUFFERED=1
+RuntimeDirectory=omni-ai-controller
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0000
+ExecStartPre=-/usr/bin/rm -f /run/omni-ai-controller/controller.sock
+ExecStart=/opt/omni-ai-controller/venv/bin/python -m omni_ai_controller.service
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/run/omni-ai-controller @MODEL_DIR@
+
+[Install]
+WantedBy=multi-user.target

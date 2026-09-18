@@ -31,6 +31,10 @@ class LocalModelServer:
         self.refresh()
         return self.client.stop_model()
 
+    def restart(self) -> dict[str, Any]:
+        self.refresh()
+        return self.client.restart_model()
+
     def status(self) -> tuple[str, dict[str, Any] | None, str | None]:
         if not (self.config.model_dir / ".env").is_file():
             return "尚未部署模型容器。", None, "模型控制 API 尚未初始化。"

@@ -10,8 +10,23 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+service = [
+	"fastapi==0.116.1",
+	"psutil==7.0.0",
+	"uvicorn==0.35.0",
+]
+test = [
+	"httpx==0.28.1",
+	"pytest==8.4.1",
+]
+
 [project.scripts]
 omni-ai-controller = "omni_ai_controller.cli:main"
+omni-ai-controller-service = "omni_ai_controller.service:main"
+
+[tool.setuptools.packages.find]
+include = ["omni_ai_controller*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

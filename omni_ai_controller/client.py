@@ -52,6 +52,15 @@ class ModelServerClient:
             timeout=45,
         )
 
+    def restart_model(self) -> dict[str, Any]:
+        self.config.require_credentials()
+        return self._request(
+            "POST",
+            "/control/restart",
+            headers={"X-Control-Token": self.config.control_token},
+            timeout=60,
+        )
+
     def chat(
         self,
         messages: list[dict[str, str]],
