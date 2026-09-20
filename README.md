@@ -8,9 +8,9 @@
 flowchart LR
 	Browser["浏览器<br/>HTTPS 443"] --> Gateway["Nginx HTTPS 网关"]
 	Gateway -->|/upload/| UploadUI["文件上传页面"]
-	Gateway -->|/main/| AdminUI["服务器控制页面"]
+	Gateway -->|/dashboard/| AdminUI["服务器控制页面"]
 	Gateway -->|/api/| UploadAPI["Main Service 容器"]
-	Gateway -->|/main/api/<br/>Unix Socket| Controller["Controller systemd 服务"]
+	Gateway -->|/dashboard/api/<br/>Unix Socket| Controller["Controller systemd 服务"]
 	Controller --> Hardware["CPU / 内存 / 磁盘 / GPU"]
 	Controller --> Docker["Docker Engine"]
 	Controller --> Model["Model 容器 / vLLM"]
@@ -29,7 +29,7 @@ flowchart LR
 - 打开容器 Shell，或停止整个容器。
 - 通过受保护的 HTTP API 查询 CPU、内存、磁盘和 NVIDIA GPU 状态。
 - 仅对固定白名单中的容器执行启动、停止、重启和日志读取。
-- 为 `/main/` 网页提供模型状态、生命周期控制和对话能力。
+- 为 `/dashboard/` 网页提供模型状态、生命周期控制和对话能力。
 
 程序只保存模型仓库路径。API 密钥始终直接读取模型仓库中的 `.env`，不会复制到控制器配置中。
 
@@ -91,7 +91,7 @@ chmod +x scripts/install-service.sh
 bash scripts/install-service.sh
 ```
 
-服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。管理员令牌不会由安装脚本打印；服务器管理员可以直接从该文件中复制令牌，并在 `/main/` 登录框中输入。浏览器仅将令牌保存在当前标签页的 `sessionStorage` 中。
+服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。管理员令牌不会由安装脚本打印；服务器管理员可以直接从该文件中复制令牌，并在 `/dashboard/` 登录框中输入。浏览器仅将令牌保存在当前标签页的 `sessionStorage` 中。
 
 默认安全策略：
 
