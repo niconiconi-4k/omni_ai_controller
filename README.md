@@ -96,7 +96,7 @@ bash scripts/install-service.sh
 默认安全策略：
 
 - 只允许 `192.168.192.0/24` 客户端。
-- 只允许控制 `omni-ai-model` 和 `omni-ai-main-service`。
+- 只允许控制 `omni-ai-model`、`omni-ai-main-service` 和 `omni-ai-database`。
 - 不允许传入任意 Docker 命令、Shell 命令或 Compose 路径。
 - 控制服务仅监听 `/run/omni-ai-controller/controller.sock`。
 - 控制操作写入 systemd journal 审计日志。

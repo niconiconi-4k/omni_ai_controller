@@ -28,7 +28,7 @@ if [[ ! -f "${config_file}" ]]; then
 OMNI_MODEL_DIR=${model_dir}
 OMNI_ADMIN_TOKEN=${token}
 OMNI_ALLOWED_NETWORKS=192.168.192.0/24
-OMNI_ALLOWED_CONTAINERS=omni-ai-model,omni-ai-main-service
+OMNI_ALLOWED_CONTAINERS=omni-ai-model,omni-ai-main-service,omni-ai-database
 OMNI_CONTROLLER_SOCKET=/run/omni-ai-controller/controller.sock
 EOF
 fi

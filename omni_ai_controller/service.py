@@ -33,7 +33,7 @@ class ServiceSettings:
         network_values = os.getenv("OMNI_ALLOWED_NETWORKS", "192.168.192.0/24")
         container_values = os.getenv(
             "OMNI_ALLOWED_CONTAINERS",
-            "omni-ai-model,omni-ai-main-service",
+            "omni-ai-model,omni-ai-main-service,omni-ai-database",
         )
         try:
             networks = tuple(
