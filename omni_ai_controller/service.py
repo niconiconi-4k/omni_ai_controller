@@ -9,16 +9,19 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .admin import AdminCommandError, AdminController
+from .admin_session import issue_admin_session, validate_admin_csrf, validate_admin_session
 from .client import ServerRequestError
 from .config import ConfigurationError
 
 LOGGER = logging.getLogger("omni_ai_controller.service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+ADMIN_SESSION_COOKIE = "omni_admin_session"
+ADMIN_CSRF_COOKIE = "omni_admin_csrf"
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,7 @@ class ServiceSettings:
     admin_token: str
     allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     allowed_containers: tuple[str, ...]
+    admin_session_ttl_hours: int = 12
 
     @classmethod
     def from_environment(cls) -> "ServiceSettings":
@@ -50,12 +54,20 @@ class ServiceSettings:
             raise RuntimeError("OMNI_ALLOWED_NETWORKS 不能为空")
         if not containers:
             raise RuntimeError("OMNI_ALLOWED_CONTAINERS 不能为空")
+        session_ttl_hours = int(os.getenv("OMNI_ADMIN_SESSION_TTL_HOURS", "12"))
+        if session_ttl_hours < 1 or session_ttl_hours > 168:
+            raise RuntimeError("OMNI_ADMIN_SESSION_TTL_HOURS 必须介于 1 和 168 之间")
         return cls(
             model_dir=Path(os.getenv("OMNI_MODEL_DIR", "/opt/ai_server/omni_ai_model")),
             admin_token=os.getenv("OMNI_ADMIN_TOKEN", ""),
             allowed_networks=networks,
             allowed_containers=containers,
+            admin_session_ttl_hours=session_ttl_hours,
         )
+
+
+class AdminLoginRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=1024)
 
 
 class ChatMessage(BaseModel):
@@ -106,18 +118,81 @@ def create_app(
             )
         return await call_next(request)
 
-    def require_admin(authorization: Annotated[str | None, Header()] = None) -> None:
+    def require_admin(
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> None:
         if not active_settings.admin_token:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin token is not configured")
         supplied = authorization.removeprefix("Bearer ") if authorization else ""
-        if not hmac.compare_digest(supplied, active_settings.admin_token):
+        if supplied and hmac.compare_digest(supplied, active_settings.admin_token):
+            return
+        csrf_hash = validate_admin_session(
+            active_settings.admin_token,
+            request.cookies.get(ADMIN_SESSION_COOKIE, ""),
+        )
+        if csrf_hash is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token")
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not validate_admin_csrf(
+            csrf_hash,
+            request.cookies.get(ADMIN_CSRF_COOKIE, ""),
+            request.headers.get("x-csrf-token", ""),
+        ):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF validation failed")
 
     admin = Depends(require_admin)
 
     @application.get("/health/live")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @application.post("/auth/login")
+    def admin_login(payload: AdminLoginRequest, response: Response, request: Request) -> dict[str, str]:
+        if not active_settings.admin_token:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin token is not configured")
+        if not hmac.compare_digest(payload.token, active_settings.admin_token):
+            LOGGER.warning("admin login failed client=%s", _client_ip(request))
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token")
+        session_token, csrf_token = issue_admin_session(
+            active_settings.admin_token,
+            active_settings.admin_session_ttl_hours,
+        )
+        max_age = active_settings.admin_session_ttl_hours * 3600
+        response.set_cookie(
+            ADMIN_SESSION_COOKIE,
+            session_token,
+            max_age=max_age,
+            secure=True,
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+        response.set_cookie(
+            ADMIN_CSRF_COOKIE,
+            csrf_token,
+            max_age=max_age,
+            secure=True,
+            httponly=False,
+            samesite="strict",
+            path="/",
+        )
+        LOGGER.info("admin login succeeded client=%s", _client_ip(request))
+        return {"csrf_token": csrf_token}
+
+    @application.get("/auth/check", status_code=status.HTTP_204_NO_CONTENT, dependencies=[admin])
+    def admin_check() -> Response:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @application.get("/auth/session", dependencies=[admin])
+    def admin_session(request: Request) -> dict[str, str]:
+        return {"csrf_token": request.cookies.get(ADMIN_CSRF_COOKIE, "")}
+
+    @application.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT, dependencies=[admin])
+    def admin_logout() -> Response:
+        response = Response(status_code=status.HTTP_204_NO_CONTENT)
+        response.delete_cookie(ADMIN_SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+        response.delete_cookie(ADMIN_CSRF_COOKIE, path="/", secure=True, httponly=False, samesite="strict")
+        return response
 
     @application.get("/overview", dependencies=[admin])
     def overview() -> dict[str, object]:

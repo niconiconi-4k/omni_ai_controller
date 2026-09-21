@@ -91,12 +91,12 @@ chmod +x scripts/install-service.sh
 bash scripts/install-service.sh
 ```
 
-服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。管理员令牌不会由安装脚本打印；服务器管理员可以直接从该文件中复制令牌，并在 `/dashboard/` 登录框中输入。浏览器仅将令牌保存在当前标签页的 `sessionStorage` 中。
+服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。管理员令牌不会由安装脚本打印；服务器管理员从该文件中取得令牌，并在独立的 `/admin-login/` 页面完成认证。控制器验证密钥后签发 12 小时有效的 HMAC 管理员会话和 CSRF token，原始管理员密钥不会写入 Cookie、网页存储或前端日志。
 
 默认安全策略：
 
 - 只允许 `192.168.192.0/24` 客户端。
-- 只允许控制 `omni-ai-model`、`omni-ai-main-service` 和 `omni-ai-database`。
+- 只允许控制 `omni-ai-model`、`omni-ai-receipt-ocr`、`omni-ai-main-service` 和 `omni-ai-database`。
 - 不允许传入任意 Docker 命令、Shell 命令或 Compose 路径。
 - 控制服务仅监听 `/run/omni-ai-controller/controller.sock`。
 - 控制操作写入 systemd journal 审计日志。

@@ -39,7 +39,10 @@ def client() -> TestClient:
         allowed_networks=(ipaddress.ip_network("192.168.192.0/24"),),
         allowed_containers=("omni-ai-model",),
     )
-    return TestClient(create_app(settings, FakeController()))
+    return TestClient(
+        create_app(settings, FakeController()),
+        base_url="https://testserver",
+    )
 
 
 def headers(token: str = "secret-token", ip: str = "192.168.192.10") -> dict[str, str]:
@@ -69,3 +72,41 @@ def test_control_and_chat_routes() -> None:
         )
         assert response.status_code == 200
         assert response.json()["content"] == "你好"
+
+
+def test_browser_admin_session_requires_key_and_csrf() -> None:
+    network_headers = {"X-Forwarded-For": "192.168.192.10"}
+    with client() as test_client:
+        rejected = test_client.post(
+            "/auth/login",
+            headers=network_headers,
+            json={"token": "wrong"},
+        )
+        assert rejected.status_code == 401
+
+        login = test_client.post(
+            "/auth/login",
+            headers=network_headers,
+            json={"token": "secret-token"},
+        )
+        assert login.status_code == 200
+        csrf_token = login.json()["csrf_token"]
+        assert "omni_admin_session=" in login.headers["set-cookie"]
+        assert "HttpOnly" in login.headers["set-cookie"]
+        assert "Secure" in login.headers["set-cookie"]
+        assert "secret-token" not in login.headers["set-cookie"]
+
+        assert test_client.get("/auth/check", headers=network_headers).status_code == 204
+        assert test_client.get("/overview", headers=network_headers).status_code == 200
+        assert test_client.post("/model/start", headers=network_headers).status_code == 403
+
+        action_headers = {
+            **network_headers,
+            "X-CSRF-Token": csrf_token,
+        }
+        action = test_client.post("/model/start", headers=action_headers)
+        assert action.status_code == 200
+
+        logout = test_client.post("/auth/logout", headers=action_headers)
+        assert logout.status_code == 204
+        assert test_client.get("/auth/check", headers=network_headers).status_code == 401

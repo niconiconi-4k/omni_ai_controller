@@ -27,13 +27,18 @@ if [[ ! -f "${config_file}" ]]; then
   cat >"${config_file}" <<EOF
 OMNI_MODEL_DIR=${model_dir}
 OMNI_ADMIN_TOKEN=${token}
+OMNI_ADMIN_SESSION_TTL_HOURS=12
 OMNI_ALLOWED_NETWORKS=192.168.192.0/24
 OMNI_ALLOWED_CONTAINERS=omni-ai-model,omni-ai-receipt-ocr,omni-ai-main-service,omni-ai-database
 OMNI_CONTROLLER_SOCKET=/run/omni-ai-controller/controller.sock
 EOF
-elif grep -q '^OMNI_ALLOWED_CONTAINERS=' "${config_file}" && \
-     ! grep -q '^OMNI_ALLOWED_CONTAINERS=.*omni-ai-receipt-ocr' "${config_file}"; then
+fi
+if grep -q '^OMNI_ALLOWED_CONTAINERS=' "${config_file}" && \
+   ! grep -q '^OMNI_ALLOWED_CONTAINERS=.*omni-ai-receipt-ocr' "${config_file}"; then
   sed -i '/^OMNI_ALLOWED_CONTAINERS=/ s/$/,omni-ai-receipt-ocr/' "${config_file}"
+fi
+if ! grep -q '^OMNI_ADMIN_SESSION_TTL_HOURS=' "${config_file}"; then
+  printf '\nOMNI_ADMIN_SESSION_TTL_HOURS=12\n' >>"${config_file}"
 fi
 chmod 0600 "${config_file}"
 install -d -m 0755 /run/omni-ai-controller
@@ -45,7 +50,8 @@ sed \
 chmod 0644 "${unit_file}"
 
 systemctl daemon-reload
-systemctl enable --now omni-ai-controller.service
+systemctl enable omni-ai-controller.service
+systemctl restart omni-ai-controller.service
 systemctl --no-pager --full status omni-ai-controller.service
 
 printf '\nAdmin token is stored in %s (mode 0600).\n' "${config_file}"
