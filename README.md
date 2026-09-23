@@ -14,7 +14,7 @@ flowchart LR
 	Controller --> Hardware["CPU / 内存 / 磁盘 / GPU"]
 	Controller --> Docker["Docker Engine"]
 	Controller --> Model["Model 容器 / vLLM"]
-	Controller --> ConversationDB[("PostgreSQL<br/>模型对话")]
+	Controller --> ConversationDB[("PostgreSQL<br/>模型对话 / 指标历史")]
 ```
 
 只有 Nginx 对外监听 HTTPS 443。控制 API 通过挂载到网关容器中的 Unix Socket 提供，不开放额外 TCP 端口，也不将 Docker Socket 暴露给容器。
@@ -33,6 +33,9 @@ flowchart LR
 - 为 `/dashboard/` 网页提供模型状态、生命周期控制和对话能力。
 - 为 Dashboard 提供可创建、选择、重命名和删除的持久化多对话；用户消息与模型回复自动保存。
 - 每次生成时从数据库恢复最近 32 条上下文，刷新页面或更换浏览器后仍可继续对话。
+- 每 5 秒采集 CPU、内存、数据磁盘和首块 NVIDIA GPU，并提供五分钟、一天、一周、一月和一年历史曲线。
+- 自动将旧数据降采样：5 秒保留 48 小时、1 分钟保留 45 天、15 分钟保留 400 天、1 小时保留 3 年。
+- GPU 曲线包含利用率、显存、温度和板卡功耗；整机功耗只有在检测到可信整机传感器时才会显示。
 
 程序只保存模型仓库路径。API 密钥始终直接读取模型仓库中的 `.env`，不会复制到控制器配置中。
 
@@ -108,6 +111,10 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 - `PATCH /conversations/{id}`：修改标题。
 - `DELETE /conversations/{id}`：软删除对话。
 - `POST /conversations/{id}/chat`：保存用户消息、调用当前模型并保存模型回复。
+
+硬件历史接口为 `GET /metrics/history?metric={cpu|memory|disk|gpu}&range={5m|1d|7d|30d|1y}`，沿用 Dashboard 管理员鉴权。后台采样线程直接读取宿主机指标，不调用 Docker 或模型状态接口；数据库暂时不可用时不会阻塞实时 `/overview`。
+
+当前主机仅检测到 `amdgpu` 的局部 hwmon 功耗输入，不能代表整机，因此 `host_power_watts` 保持为空。NVIDIA GPU 的 `power_watts` 仍由 `nvidia-smi` 正常采集和展示。以后接入可信的 UPS、PDU 或外置整机功率计时，才应填充整机功耗字段。
 
 默认安全策略：
 

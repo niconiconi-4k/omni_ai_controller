@@ -75,6 +75,10 @@ def hardware_status(data_path: Path = Path("/opt/ai_server")) -> dict[str, Any]:
     return {
         "timestamp": time.time(),
         "uptime_seconds": max(0, time.time() - psutil.boot_time()),
+        # Only populate this from a verified whole-system meter. CPU package,
+        # motherboard rails and GPU power must not be presented as host power.
+        "host_power_watts": None,
+        "host_power_source": None,
         "cpu": {
             "percent": _round(psutil.cpu_percent(interval=0.1)),
             "logical_cores": psutil.cpu_count(logical=True),

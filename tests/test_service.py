@@ -111,15 +111,56 @@ class FakeConversationStore:
         return self.items[conversation_id], message
 
 
+class FakeMetricStore:
+    def history(self, metric: str, range_name: str) -> dict[str, object]:
+        return {
+            "metric": metric,
+            "range": range_name,
+            "resolution_seconds": 60,
+            "resolution_label": "1 分钟",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-01-02T00:00:00Z",
+            "series": [
+                {
+                    "key": "cpu_percent",
+                    "label": "CPU 使用率",
+                    "unit": "%",
+                    "color": "#5ee7d0",
+                }
+            ],
+            "points": [
+                {
+                    "timestamp": "2026-01-01T12:00:00Z",
+                    "values": {"cpu_percent": 25.0},
+                }
+            ],
+            "summaries": {
+                "cpu_percent": {
+                    "latest": 25.0,
+                    "average": 25.0,
+                    "minimum": 25.0,
+                    "maximum": 25.0,
+                }
+            },
+            "capabilities": {"host_power": False},
+        }
+
+
 def client() -> TestClient:
     settings = ServiceSettings(
         model_dir=Path("/tmp/model"),
         admin_token="secret-token",
         allowed_networks=(ipaddress.ip_network("192.168.192.0/24"),),
         allowed_containers=("omni-ai-model",),
+        metric_collection_enabled=False,
     )
     return TestClient(
-        create_app(settings, FakeController(), FakeConversationStore()),  # type: ignore[arg-type]
+        create_app(
+            settings,
+            FakeController(),
+            FakeConversationStore(),
+            FakeMetricStore(),
+        ),  # type: ignore[arg-type]
         base_url="https://testserver",
     )
 
@@ -133,6 +174,28 @@ def test_overview_requires_network_and_token() -> None:
         assert test_client.get("/overview", headers=headers()).status_code == 200
         assert test_client.get("/overview", headers=headers(token="wrong")).status_code == 401
         assert test_client.get("/overview", headers=headers(ip="192.168.50.10")).status_code == 403
+
+
+def test_metric_history_is_authenticated_and_validated() -> None:
+    with client() as test_client:
+        assert test_client.get(
+            "/metrics/history?metric=cpu&range=1d",
+            headers=headers(token="wrong"),
+        ).status_code == 401
+
+        response = test_client.get(
+            "/metrics/history?metric=cpu&range=1d",
+            headers=headers(),
+        )
+        assert response.status_code == 200
+        assert response.json()["metric"] == "cpu"
+        assert response.json()["range"] == "1d"
+        assert response.json()["points"][0]["values"]["cpu_percent"] == 25.0
+
+        assert test_client.get(
+            "/metrics/history?metric=cpu&range=forever",
+            headers=headers(),
+        ).status_code == 422
 
 
 def test_control_and_chat_routes() -> None:

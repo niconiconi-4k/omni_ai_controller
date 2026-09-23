@@ -4,6 +4,7 @@ import hmac
 import ipaddress
 import logging
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
@@ -22,6 +23,8 @@ from .conversation_store import (
     ConversationStore,
     ConversationStoreError,
 )
+from .hardware import hardware_status
+from .metric_store import MetricCollector, MetricName, MetricRange, MetricStore, MetricStoreError
 
 LOGGER = logging.getLogger("omni_ai_controller.service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -41,6 +44,7 @@ class ServiceSettings:
     database_name: str = "omni_ai"
     database_user: str = "omni_ai"
     database_password: str = ""
+    metric_collection_enabled: bool = True
 
     @classmethod
     def from_environment(cls) -> "ServiceSettings":
@@ -78,6 +82,10 @@ class ServiceSettings:
             database_name=os.getenv("DATABASE_NAME", "omni_ai"),
             database_user=os.getenv("DATABASE_USER", "omni_ai"),
             database_password=os.getenv("DATABASE_PASSWORD", ""),
+            metric_collection_enabled=os.getenv(
+                "OMNI_METRIC_COLLECTION_ENABLED", "true"
+            ).lower()
+            not in {"0", "false", "no"},
         )
 
 
@@ -122,6 +130,7 @@ def create_app(
     settings: ServiceSettings | None = None,
     controller: AdminController | None = None,
     conversation_store: ConversationStore | None = None,
+    metric_store: MetricStore | None = None,
 ) -> FastAPI:
     active_settings = settings or ServiceSettings.from_environment()
     active_controller = controller or AdminController(
@@ -135,12 +144,32 @@ def create_app(
         user=active_settings.database_user,
         password=active_settings.database_password,
     )
+    active_metric_store = metric_store or MetricStore(
+        host=active_settings.database_host,
+        port=active_settings.database_port,
+        database=active_settings.database_name,
+        user=active_settings.database_user,
+        password=active_settings.database_password,
+    )
+    metric_collector = MetricCollector(active_metric_store, hardware_status)
+
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI):  # type: ignore[no-untyped-def]
+        if active_settings.metric_collection_enabled:
+            metric_collector.start()
+        try:
+            yield
+        finally:
+            if active_settings.metric_collection_enabled:
+                metric_collector.stop()
+
     application = FastAPI(
         title="Omni AI Host Controller",
         version="1.0.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
 
     @application.middleware("http")
@@ -234,6 +263,20 @@ def create_app(
     @application.get("/overview", dependencies=[admin])
     def overview() -> dict[str, object]:
         return active_controller.overview()
+
+    @application.get("/metrics/history", dependencies=[admin])
+    def metric_history(
+        metric: MetricName,
+        range_name: Annotated[MetricRange, Query(alias="range")] = "5m",
+    ) -> dict[str, object]:
+        try:
+            return active_metric_store.history(metric, range_name)
+        except MetricStoreError as exc:
+            LOGGER.exception("hardware metric history query failed")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
 
     @application.post("/model/{action}", dependencies=[admin])
     def model_action(action: Literal["start", "stop", "restart"], request: Request) -> dict[str, object]:
