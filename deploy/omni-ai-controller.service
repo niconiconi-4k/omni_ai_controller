@@ -10,6 +10,7 @@ User=root
 Group=root
 WorkingDirectory=@PROJECT_DIR@
 EnvironmentFile=/etc/omni-ai-controller/service.env
+EnvironmentFile=-/var/lib/omni-ai/config/database.env
 Environment=PYTHONUNBUFFERED=1
 RuntimeDirectory=omni-ai-controller
 RuntimeDirectoryMode=0755

@@ -31,6 +31,8 @@ OMNI_ADMIN_SESSION_TTL_HOURS=12
 OMNI_ALLOWED_NETWORKS=192.168.192.0/24
 OMNI_ALLOWED_CONTAINERS=omni-ai-model,omni-ai-receipt-ocr,omni-ai-main-service,omni-ai-database
 OMNI_CONTROLLER_SOCKET=/run/omni-ai-controller/controller.sock
+OMNI_CONVERSATION_DATABASE_HOST=127.0.0.1
+OMNI_CONVERSATION_DATABASE_PORT=15432
 EOF
 fi
 if grep -q '^OMNI_ALLOWED_CONTAINERS=' "${config_file}" && \
@@ -39,6 +41,12 @@ if grep -q '^OMNI_ALLOWED_CONTAINERS=' "${config_file}" && \
 fi
 if ! grep -q '^OMNI_ADMIN_SESSION_TTL_HOURS=' "${config_file}"; then
   printf '\nOMNI_ADMIN_SESSION_TTL_HOURS=12\n' >>"${config_file}"
+fi
+if ! grep -q '^OMNI_CONVERSATION_DATABASE_HOST=' "${config_file}"; then
+  printf 'OMNI_CONVERSATION_DATABASE_HOST=127.0.0.1\n' >>"${config_file}"
+fi
+if ! grep -q '^OMNI_CONVERSATION_DATABASE_PORT=' "${config_file}"; then
+  printf 'OMNI_CONVERSATION_DATABASE_PORT=15432\n' >>"${config_file}"
 fi
 chmod 0600 "${config_file}"
 install -d -m 0755 /run/omni-ai-controller

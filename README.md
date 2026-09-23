@@ -14,6 +14,7 @@ flowchart LR
 	Controller --> Hardware["CPU / 内存 / 磁盘 / GPU"]
 	Controller --> Docker["Docker Engine"]
 	Controller --> Model["Model 容器 / vLLM"]
+	Controller --> ConversationDB[("PostgreSQL<br/>模型对话")]
 ```
 
 只有 Nginx 对外监听 HTTPS 443。控制 API 通过挂载到网关容器中的 Unix Socket 提供，不开放额外 TCP 端口，也不将 Docker Socket 暴露给容器。
@@ -30,6 +31,8 @@ flowchart LR
 - 通过受保护的 HTTP API 查询 CPU、内存、磁盘和 NVIDIA GPU 状态。
 - 仅对固定白名单中的容器执行启动、停止、重启和日志读取。
 - 为 `/dashboard/` 网页提供模型状态、生命周期控制和对话能力。
+- 为 Dashboard 提供可创建、选择、重命名和删除的持久化多对话；用户消息与模型回复自动保存。
+- 每次生成时从数据库恢复最近 32 条上下文，刷新页面或更换浏览器后仍可继续对话。
 
 程序只保存模型仓库路径。API 密钥始终直接读取模型仓库中的 `.env`，不会复制到控制器配置中。
 
@@ -92,6 +95,19 @@ bash scripts/install-service.sh
 ```
 
 服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。管理员令牌不会由安装脚本打印；服务器管理员从该文件中取得令牌，并在独立的 `/admin-login/` 页面完成认证。控制器验证密钥后签发 12 小时有效的 HMAC 管理员会话和 CSRF token，原始管理员密钥不会写入 Cookie、网页存储或前端日志。
+
+Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` 表。数据库只在宿主机回环地址 `127.0.0.1:15432` 为 Controller 提供连接，不向局域网或公网开放。Controller 从 `/var/lib/omni-ai/config/database.env` 读取数据库凭据；该文件不得提交到 Git 或输出到日志。
+
+当前管理 API 固定操作 `dashboard` 作用域，因此只能看到 Dashboard 创建的会话。数据模型同时预留 `account` 作用域和 `owner_account_id`，以后普通用户客服对话可复用同一组表，并由业务服务按登录账号隔离。
+
+主要会话接口：
+
+- `GET /conversations`：列出 Dashboard 对话。
+- `POST /conversations`：创建新对话。
+- `GET /conversations/{id}`：读取对话及消息历史。
+- `PATCH /conversations/{id}`：修改标题。
+- `DELETE /conversations/{id}`：软删除对话。
+- `POST /conversations/{id}/chat`：保存用户消息、调用当前模型并保存模型回复。
 
 默认安全策略：
 

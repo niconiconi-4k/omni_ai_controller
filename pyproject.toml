@@ -14,6 +14,7 @@ dependencies = []
 service = [
 	"fastapi==0.116.1",
 	"psutil==7.0.0",
+	"psycopg[binary]==3.2.9",
 	"uvicorn==0.35.0",
 ]
 test = [

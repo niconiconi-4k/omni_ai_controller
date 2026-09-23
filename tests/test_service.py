@@ -32,6 +32,85 @@ class FakeController:
         return {"container": name, "logs": f"last {tail}"}
 
 
+class FakeConversationStore:
+    def __init__(self) -> None:
+        self.items: dict[str, dict[str, object]] = {}
+        self.messages: dict[str, list[dict[str, object]]] = {}
+        self.counter = 0
+
+    def list_conversations(self) -> list[dict[str, object]]:
+        return list(reversed(self.items.values()))
+
+    def create_conversation(
+        self,
+        *,
+        title: str,
+        model_name: str | None,
+        enable_thinking: bool,
+    ) -> dict[str, object]:
+        self.counter += 1
+        conversation_id = f"conversation-{self.counter}"
+        conversation = {
+            "id": conversation_id,
+            "title": title,
+            "model_name": model_name,
+            "enable_thinking": enable_thinking,
+            "message_count": 0,
+            "last_message": "",
+        }
+        self.items[conversation_id] = conversation
+        self.messages[conversation_id] = []
+        return conversation
+
+    def get_conversation(self, conversation_id: str) -> dict[str, object]:
+        return {**self.items[conversation_id], "messages": self.messages[conversation_id]}
+
+    def rename_conversation(self, conversation_id: str, title: str) -> dict[str, object]:
+        self.items[conversation_id]["title"] = title
+        return self.items[conversation_id]
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        del self.items[conversation_id]
+        del self.messages[conversation_id]
+
+    def start_turn(
+        self,
+        conversation_id: str,
+        *,
+        content: str,
+        model_name: str | None,
+        enable_thinking: bool,
+    ) -> tuple[dict[str, object], dict[str, object], list[dict[str, str]]]:
+        message = {"id": "user-1", "role": "user", "content": content, "reasoning_content": ""}
+        self.messages[conversation_id].append(message)
+        if self.items[conversation_id]["title"] == "新对话":
+            self.items[conversation_id]["title"] = content
+        self.items[conversation_id]["message_count"] = len(self.messages[conversation_id])
+        return self.items[conversation_id], message, [
+            {"role": item["role"], "content": item["content"]}  # type: ignore[dict-item]
+            for item in self.messages[conversation_id]
+        ]
+
+    def finish_turn(
+        self,
+        conversation_id: str,
+        *,
+        content: str,
+        reasoning_content: str,
+        model_name: str | None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        message = {
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": content,
+            "reasoning_content": reasoning_content,
+        }
+        self.messages[conversation_id].append(message)
+        self.items[conversation_id]["message_count"] = len(self.messages[conversation_id])
+        self.items[conversation_id]["last_message"] = content
+        return self.items[conversation_id], message
+
+
 def client() -> TestClient:
     settings = ServiceSettings(
         model_dir=Path("/tmp/model"),
@@ -40,7 +119,7 @@ def client() -> TestClient:
         allowed_containers=("omni-ai-model",),
     )
     return TestClient(
-        create_app(settings, FakeController()),
+        create_app(settings, FakeController(), FakeConversationStore()),  # type: ignore[arg-type]
         base_url="https://testserver",
     )
 
@@ -72,6 +151,45 @@ def test_control_and_chat_routes() -> None:
         )
         assert response.status_code == 200
         assert response.json()["content"] == "你好"
+
+
+def test_persisted_conversation_lifecycle() -> None:
+    with client() as test_client:
+        created = test_client.post(
+            "/conversations",
+            headers=headers(),
+            json={"title": "新对话", "enable_thinking": False},
+        )
+        assert created.status_code == 201
+        conversation_id = created.json()["conversation"]["id"]
+
+        response = test_client.post(
+            f"/conversations/{conversation_id}/chat",
+            headers=headers(),
+            json={"content": "检查模型状态", "enable_thinking": False},
+        )
+        assert response.status_code == 200
+        assert response.json()["conversation"]["title"] == "检查模型状态"
+        assert response.json()["user_message"]["role"] == "user"
+        assert response.json()["assistant_message"]["content"] == "你好"
+
+        detail = test_client.get(f"/conversations/{conversation_id}", headers=headers())
+        assert [item["role"] for item in detail.json()["conversation"]["messages"]] == [
+            "user",
+            "assistant",
+        ]
+
+        renamed = test_client.patch(
+            f"/conversations/{conversation_id}",
+            headers=headers(),
+            json={"title": "运行诊断"},
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["conversation"]["title"] == "运行诊断"
+
+        deleted = test_client.delete(f"/conversations/{conversation_id}", headers=headers())
+        assert deleted.status_code == 204
+        assert test_client.get("/conversations", headers=headers()).json()["items"] == []
 
 
 def test_browser_admin_session_requires_key_and_csrf() -> None:

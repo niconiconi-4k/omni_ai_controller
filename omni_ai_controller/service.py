@@ -17,6 +17,11 @@ from .admin import AdminCommandError, AdminController
 from .admin_session import issue_admin_session, validate_admin_csrf, validate_admin_session
 from .client import ServerRequestError
 from .config import ConfigurationError
+from .conversation_store import (
+    ConversationNotFoundError,
+    ConversationStore,
+    ConversationStoreError,
+)
 
 LOGGER = logging.getLogger("omni_ai_controller.service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -31,6 +36,11 @@ class ServiceSettings:
     allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     allowed_containers: tuple[str, ...]
     admin_session_ttl_hours: int = 12
+    database_host: str = "127.0.0.1"
+    database_port: int = 15432
+    database_name: str = "omni_ai"
+    database_user: str = "omni_ai"
+    database_password: str = ""
 
     @classmethod
     def from_environment(cls) -> "ServiceSettings":
@@ -63,6 +73,11 @@ class ServiceSettings:
             allowed_networks=networks,
             allowed_containers=containers,
             admin_session_ttl_hours=session_ttl_hours,
+            database_host=os.getenv("OMNI_CONVERSATION_DATABASE_HOST", "127.0.0.1"),
+            database_port=int(os.getenv("OMNI_CONVERSATION_DATABASE_PORT", "15432")),
+            database_name=os.getenv("DATABASE_NAME", "omni_ai"),
+            database_user=os.getenv("DATABASE_USER", "omni_ai"),
+            database_password=os.getenv("DATABASE_PASSWORD", ""),
         )
 
 
@@ -80,6 +95,20 @@ class ChatRequest(BaseModel):
     enable_thinking: bool = True
 
 
+class CreateConversationRequest(BaseModel):
+    title: str = Field(default="新对话", min_length=1, max_length=160)
+    enable_thinking: bool = True
+
+
+class RenameConversationRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+
+
+class ConversationChatRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=16_000)
+    enable_thinking: bool = True
+
+
 def _client_ip(request: Request) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
     candidate = forwarded or (request.client.host if request.client else "")
@@ -92,11 +121,19 @@ def _client_ip(request: Request) -> ipaddress.IPv4Address | ipaddress.IPv6Addres
 def create_app(
     settings: ServiceSettings | None = None,
     controller: AdminController | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> FastAPI:
     active_settings = settings or ServiceSettings.from_environment()
     active_controller = controller or AdminController(
         active_settings.model_dir,
         active_settings.allowed_containers,
+    )
+    active_conversation_store = conversation_store or ConversationStore(
+        host=active_settings.database_host,
+        port=active_settings.database_port,
+        database=active_settings.database_name,
+        user=active_settings.database_user,
+        password=active_settings.database_password,
     )
     application = FastAPI(
         title="Omni AI Host Controller",
@@ -227,6 +264,116 @@ def create_app(
             return active_controller.container_logs(name, tail)
         except AdminCommandError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    def model_name() -> str | None:
+        config = getattr(active_controller.model_server, "config", None)
+        value = getattr(config, "model_name", None)
+        return str(value) if value else None
+
+    def conversation_http_error(exc: ConversationStoreError) -> HTTPException:
+        if isinstance(exc, ConversationNotFoundError):
+            return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        LOGGER.exception("conversation store operation failed", exc_info=exc)
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        )
+
+    @application.get("/conversations", dependencies=[admin])
+    def list_conversations() -> dict[str, object]:
+        try:
+            return {"items": active_conversation_store.list_conversations()}
+        except ConversationStoreError as exc:
+            raise conversation_http_error(exc) from exc
+
+    @application.post("/conversations", status_code=status.HTTP_201_CREATED, dependencies=[admin])
+    def create_conversation(payload: CreateConversationRequest) -> dict[str, object]:
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="对话标题不能为空")
+        try:
+            conversation = active_conversation_store.create_conversation(
+                title=title,
+                model_name=model_name(),
+                enable_thinking=payload.enable_thinking,
+            )
+            return {"conversation": conversation}
+        except ConversationStoreError as exc:
+            raise conversation_http_error(exc) from exc
+
+    @application.get("/conversations/{conversation_id}", dependencies=[admin])
+    def get_conversation(conversation_id: str) -> dict[str, object]:
+        try:
+            return {"conversation": active_conversation_store.get_conversation(conversation_id)}
+        except ConversationStoreError as exc:
+            raise conversation_http_error(exc) from exc
+
+    @application.patch("/conversations/{conversation_id}", dependencies=[admin])
+    def rename_conversation(
+        conversation_id: str,
+        payload: RenameConversationRequest,
+    ) -> dict[str, object]:
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="对话标题不能为空")
+        try:
+            conversation = active_conversation_store.rename_conversation(conversation_id, title)
+            return {"conversation": conversation}
+        except ConversationStoreError as exc:
+            raise conversation_http_error(exc) from exc
+
+    @application.delete(
+        "/conversations/{conversation_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=[admin],
+    )
+    def delete_conversation(conversation_id: str) -> Response:
+        try:
+            active_conversation_store.delete_conversation(conversation_id)
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        except ConversationStoreError as exc:
+            raise conversation_http_error(exc) from exc
+
+    @application.post("/conversations/{conversation_id}/chat", dependencies=[admin])
+    def chat_in_conversation(
+        conversation_id: str,
+        payload: ConversationChatRequest,
+    ) -> dict[str, object]:
+        content = payload.content.strip()
+        if not content:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="消息不能为空")
+        active_controller.model_server.refresh()
+        active_model_name = model_name()
+        try:
+            conversation, user_message, context = active_conversation_store.start_turn(
+                conversation_id,
+                content=content,
+                model_name=active_model_name,
+                enable_thinking=payload.enable_thinking,
+            )
+        except ConversationStoreError as exc:
+            raise conversation_http_error(exc) from exc
+        try:
+            result = active_controller.model_server.client.chat(
+                context,
+                enable_thinking=payload.enable_thinking,
+            )
+        except (ConfigurationError, ServerRequestError) as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        try:
+            conversation, assistant_message = active_conversation_store.finish_turn(
+                conversation_id,
+                content=result.content,
+                reasoning_content=result.reasoning_content,
+                model_name=active_model_name,
+            )
+        except ConversationStoreError as exc:
+            raise conversation_http_error(exc) from exc
+        return {
+            "conversation": conversation,
+            "user_message": user_message,
+            "assistant_message": assistant_message,
+        }
 
     @application.post("/chat", dependencies=[admin])
     def chat(payload: ChatRequest) -> dict[str, str]:
