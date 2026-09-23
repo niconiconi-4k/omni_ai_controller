@@ -146,6 +146,41 @@ class FakeMetricStore:
         }
 
 
+class FakeVisionStore:
+    configured = False
+    model = "gpt-4o"
+
+    def status(self) -> dict[str, object]:
+        return {
+            "provider": "openai",
+            "model": self.model,
+            "configured": self.configured,
+            "updated_at": None,
+            "models": [{"id": "gpt-4o", "label": "GPT-4o", "default": True}],
+        }
+
+    def save(self, *, model: str, api_key: str | None = None) -> dict[str, object]:
+        self.model = model
+        self.configured = bool(api_key) or self.configured
+        return self.status()
+
+    def remove_key(self) -> dict[str, object]:
+        self.configured = False
+        return self.status()
+
+
+class FakeVisionClient:
+    def recognize(self, image: bytes, *, filename: str, content_type: str) -> dict[str, object]:
+        return {
+            "request_id": "vision-1",
+            "status": "accepted",
+            "model": {"provider": "openai", "vision": "gpt-4o"},
+            "receipts": [{"index": 1, "text": filename, "payment_candidates": []}],
+            "size": len(image),
+            "content_type": content_type,
+        }
+
+
 def client() -> TestClient:
     settings = ServiceSettings(
         model_dir=Path("/tmp/model"),
@@ -153,6 +188,8 @@ def client() -> TestClient:
         allowed_networks=(ipaddress.ip_network("192.168.192.0/24"),),
         allowed_containers=("omni-ai-model",),
         metric_collection_enabled=False,
+        vision_config_path=Path("/tmp/test-openai-vision.json"),
+        vision_internal_token="internal-vision-token",
     )
     return TestClient(
         create_app(
@@ -160,6 +197,8 @@ def client() -> TestClient:
             FakeController(),
             FakeConversationStore(),
             FakeMetricStore(),
+            FakeVisionStore(),
+            FakeVisionClient(),
         ),  # type: ignore[arg-type]
         base_url="https://testserver",
     )
@@ -196,6 +235,47 @@ def test_metric_history_is_authenticated_and_validated() -> None:
             "/metrics/history?metric=cpu&range=forever",
             headers=headers(),
         ).status_code == 422
+
+
+def test_vision_settings_and_internal_proxy_are_protected() -> None:
+    with client() as test_client:
+        assert test_client.get("/vision/settings", headers=headers(token="wrong")).status_code == 401
+        settings = test_client.get("/vision/settings", headers=headers())
+        assert settings.status_code == 200
+        assert settings.json()["configured"] is False
+        assert "api_key" not in settings.json()
+
+        updated = test_client.put(
+            "/vision/settings",
+            headers=headers(),
+            json={"model": "gpt-4o", "api_key": "sk-test-012345678901234567890"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["configured"] is True
+        assert "api_key" not in updated.json()
+
+        import base64
+
+        rejected = test_client.post(
+            "/internal/vision/receipts",
+            json={
+                "filename": "receipt.png",
+                "content_type": "image/png",
+                "image_base64": base64.b64encode(b"image").decode("ascii"),
+            },
+        )
+        assert rejected.status_code == 401
+        analyzed = test_client.post(
+            "/internal/vision/receipts",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "filename": "receipt.png",
+                "content_type": "image/png",
+                "image_base64": base64.b64encode(b"image").decode("ascii"),
+            },
+        )
+        assert analyzed.status_code == 200
+        assert analyzed.json()["request_id"] == "vision-1"
 
 
 def test_control_and_chat_routes() -> None:

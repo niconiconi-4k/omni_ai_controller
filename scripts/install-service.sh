@@ -21,6 +21,16 @@ cp -a "${project_dir}/omni_ai_controller" "${build_dir}/"
 "${venv_dir}/bin/python" -m pip install --quiet "${build_dir}[service]"
 
 install -d -m 0700 "${config_dir}"
+install -d -m 0700 /var/lib/omni-ai/config
+vision_shared_config=/var/lib/omni-ai/config/vision.env
+if [[ ! -f "${vision_shared_config}" ]]; then
+  vision_internal_token="$(${venv_dir}/bin/python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+  umask 077
+  printf 'VISION_INTERNAL_TOKEN=%s\n' "${vision_internal_token}" >"${vision_shared_config}"
+  chmod 0600 "${vision_shared_config}"
+fi
+chown "$(stat -c '%u:%g' "${project_dir}")" "${vision_shared_config}"
+chmod 0600 "${vision_shared_config}"
 if [[ ! -f "${config_file}" ]]; then
   token="$("${venv_dir}/bin/python" -c 'import secrets; print(secrets.token_urlsafe(32))')"
   umask 077
@@ -33,6 +43,7 @@ OMNI_ALLOWED_CONTAINERS=omni-ai-model,omni-ai-receipt-ocr,omni-ai-main-service,o
 OMNI_CONTROLLER_SOCKET=/run/omni-ai-controller/controller.sock
 OMNI_CONVERSATION_DATABASE_HOST=127.0.0.1
 OMNI_CONVERSATION_DATABASE_PORT=15432
+OMNI_OPENAI_VISION_CONFIG=/etc/omni-ai-controller/openai-vision.json
 EOF
 fi
 if grep -q '^OMNI_ALLOWED_CONTAINERS=' "${config_file}" && \
@@ -47,6 +58,9 @@ if ! grep -q '^OMNI_CONVERSATION_DATABASE_HOST=' "${config_file}"; then
 fi
 if ! grep -q '^OMNI_CONVERSATION_DATABASE_PORT=' "${config_file}"; then
   printf 'OMNI_CONVERSATION_DATABASE_PORT=15432\n' >>"${config_file}"
+fi
+if ! grep -q '^OMNI_OPENAI_VISION_CONFIG=' "${config_file}"; then
+  printf 'OMNI_OPENAI_VISION_CONFIG=/etc/omni-ai-controller/openai-vision.json\n' >>"${config_file}"
 fi
 chmod 0600 "${config_file}"
 install -d -m 0755 /run/omni-ai-controller

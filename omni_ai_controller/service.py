@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import ipaddress
 import logging
@@ -12,7 +14,7 @@ from typing import Annotated, Literal
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from .admin import AdminCommandError, AdminController
 from .admin_session import issue_admin_session, validate_admin_csrf, validate_admin_session
@@ -25,6 +27,13 @@ from .conversation_store import (
 )
 from .hardware import hardware_status
 from .metric_store import MetricCollector, MetricName, MetricRange, MetricStore, MetricStoreError
+from .vision import (
+    MAX_VISION_IMAGE_BYTES,
+    OpenAIVisionClient,
+    VisionRequestError,
+    VisionSettingsError,
+    VisionSettingsStore,
+)
 
 LOGGER = logging.getLogger("omni_ai_controller.service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -45,6 +54,8 @@ class ServiceSettings:
     database_user: str = "omni_ai"
     database_password: str = ""
     metric_collection_enabled: bool = True
+    vision_config_path: Path = Path("/etc/omni-ai-controller/openai-vision.json")
+    vision_internal_token: str = ""
 
     @classmethod
     def from_environment(cls) -> "ServiceSettings":
@@ -86,6 +97,13 @@ class ServiceSettings:
                 "OMNI_METRIC_COLLECTION_ENABLED", "true"
             ).lower()
             not in {"0", "false", "no"},
+            vision_config_path=Path(
+                os.getenv(
+                    "OMNI_OPENAI_VISION_CONFIG",
+                    "/etc/omni-ai-controller/openai-vision.json",
+                )
+            ),
+            vision_internal_token=os.getenv("VISION_INTERNAL_TOKEN", ""),
         )
 
 
@@ -117,6 +135,17 @@ class ConversationChatRequest(BaseModel):
     enable_thinking: bool = True
 
 
+class VisionSettingsUpdate(BaseModel):
+    model: Literal["gpt-4o", "gpt-4.1"] = "gpt-4o"
+    api_key: SecretStr | None = Field(default=None)
+
+
+class VisionAnalyzeRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: Literal["image/jpeg", "image/png", "image/webp"]
+    image_base64: str = Field(min_length=1, max_length=28_000_000)
+
+
 def _client_ip(request: Request) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
     candidate = forwarded or (request.client.host if request.client else "")
@@ -131,6 +160,8 @@ def create_app(
     controller: AdminController | None = None,
     conversation_store: ConversationStore | None = None,
     metric_store: MetricStore | None = None,
+    vision_settings_store: VisionSettingsStore | None = None,
+    vision_client: OpenAIVisionClient | None = None,
 ) -> FastAPI:
     active_settings = settings or ServiceSettings.from_environment()
     active_controller = controller or AdminController(
@@ -151,6 +182,10 @@ def create_app(
         user=active_settings.database_user,
         password=active_settings.database_password,
     )
+    active_vision_store = vision_settings_store or VisionSettingsStore(
+        active_settings.vision_config_path
+    )
+    active_vision_client = vision_client or OpenAIVisionClient(active_vision_store)
     metric_collector = MetricCollector(active_metric_store, hardware_status)
 
     @asynccontextmanager
@@ -174,7 +209,7 @@ def create_app(
 
     @application.middleware("http")
     async def restrict_network(request: Request, call_next):  # type: ignore[no-untyped-def]
-        if request.url.path == "/health/live":
+        if request.url.path in {"/health/live", "/internal/vision/receipts"}:
             return await call_next(request)
         address = _client_ip(request)
         if address is None or not any(address in network for network in active_settings.allowed_networks):
@@ -207,6 +242,23 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF validation failed")
 
     admin = Depends(require_admin)
+
+    def require_vision_internal(
+        x_vision_token: Annotated[str | None, Header()] = None,
+    ) -> None:
+        expected = active_settings.vision_internal_token
+        if not expected:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Vision proxy token is not configured",
+            )
+        if not x_vision_token or not hmac.compare_digest(x_vision_token, expected):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid vision proxy token",
+            )
+
+    vision_internal = Depends(require_vision_internal)
 
     @application.get("/health/live")
     def health() -> dict[str, str]:
@@ -263,6 +315,62 @@ def create_app(
     @application.get("/overview", dependencies=[admin])
     def overview() -> dict[str, object]:
         return active_controller.overview()
+
+    @application.get("/vision/settings", dependencies=[admin])
+    def get_vision_settings() -> dict[str, object]:
+        try:
+            return active_vision_store.status()
+        except VisionSettingsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+
+    @application.put("/vision/settings", dependencies=[admin])
+    def update_vision_settings(payload: VisionSettingsUpdate) -> dict[str, object]:
+        try:
+            return active_vision_store.save(
+                model=payload.model,
+                api_key=(payload.api_key.get_secret_value() if payload.api_key else None),
+            )
+        except VisionSettingsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+
+    @application.delete("/vision/settings/key", dependencies=[admin])
+    def delete_vision_key() -> dict[str, object]:
+        try:
+            return active_vision_store.remove_key()
+        except VisionSettingsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+
+    @application.post("/internal/vision/receipts", dependencies=[vision_internal])
+    def analyze_receipt(payload: VisionAnalyzeRequest) -> dict[str, object]:
+        try:
+            image = base64.b64decode(payload.image_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid base64 image",
+            ) from exc
+        if not image or len(image) > MAX_VISION_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Vision image must be between 1 byte and 20 MiB",
+            )
+        try:
+            return active_vision_client.recognize(
+                image,
+                filename=payload.filename,
+                content_type=payload.content_type,
+            )
+        except VisionRequestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     @application.get("/metrics/history", dependencies=[admin])
     def metric_history(
