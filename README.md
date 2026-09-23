@@ -29,6 +29,7 @@ flowchart LR
 - 查看最近一次模型 output 和当前对话历史。
 - 打开容器 Shell，或停止整个容器。
 - 通过受保护的 HTTP API 查询 CPU、内存、磁盘和 NVIDIA GPU 状态。
+- 通过仅限 Unix Socket 和内部令牌的 `/internal/support/chat` 端点为用户客服调用本地 Qwen；系统提示词由 Controller 固定注入，调用方不能覆盖。
 - 仅对固定白名单中的容器执行启动、停止、重启和日志读取。
 - 为 `/dashboard/` 网页提供模型状态、生命周期控制和对话能力。
 - 为 Dashboard 提供可创建、选择、重命名和删除的持久化多对话；用户消息与模型回复自动保存。
