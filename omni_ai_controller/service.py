@@ -166,6 +166,10 @@ class SupportChatRequest(BaseModel):
     messages: list[SupportMessage] = Field(min_length=1, max_length=30)
 
 
+class InternalAdminAuthorizationRequest(BaseModel):
+    method: Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
+
+
 def _client_ip(request: Request) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
     candidate = forwarded or (request.client.host if request.client else "")
@@ -233,6 +237,7 @@ def create_app(
             "/health/live",
             "/internal/vision/receipts",
             "/internal/support/chat",
+            "/internal/admin/authorize",
         }:
             return await call_next(request)
         address = _client_ip(request)
@@ -417,6 +422,30 @@ def create_app(
             "content": result.content,
             "model": active_controller.model_server.client.config.model_name,
         }
+
+    @application.post("/internal/admin/authorize", dependencies=[vision_internal])
+    def authorize_internal_admin(
+        payload: InternalAdminAuthorizationRequest, request: Request
+    ) -> Response:
+        csrf_hash = validate_admin_session(
+            active_settings.admin_token,
+            request.cookies.get(ADMIN_SESSION_COOKIE, ""),
+        )
+        if csrf_hash is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid admin token",
+            )
+        if payload.method not in {"GET", "HEAD", "OPTIONS"} and not validate_admin_csrf(
+            csrf_hash,
+            request.cookies.get(ADMIN_CSRF_COOKIE, ""),
+            request.headers.get("x-csrf-token", ""),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF validation failed",
+            )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.get("/metrics/history", dependencies=[admin])
     def metric_history(

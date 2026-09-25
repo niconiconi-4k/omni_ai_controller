@@ -308,6 +308,59 @@ def test_internal_support_chat_uses_fixed_system_prompt() -> None:
         assert injected.status_code == 422
 
 
+def test_internal_admin_authorization_requires_admin_session_and_csrf() -> None:
+    with client() as test_client:
+        missing_internal_token = test_client.post(
+            "/internal/admin/authorize", json={"method": "GET"}
+        )
+        assert missing_internal_token.status_code == 401
+
+        login = test_client.post(
+            "/auth/login",
+            headers=headers(),
+            json={"token": "secret-token"},
+        )
+        assert login.status_code == 200
+        admin_csrf = login.json()["csrf_token"]
+        admin_cookies = {
+            "omni_admin_session": login.cookies["omni_admin_session"],
+            "omni_admin_csrf": admin_csrf,
+        }
+        internal_headers = {"X-Vision-Token": "internal-vision-token"}
+        test_client.cookies.clear()
+
+        no_session = test_client.post(
+            "/internal/admin/authorize",
+            headers=internal_headers,
+            json={"method": "GET"},
+        )
+        assert no_session.status_code == 401
+
+        read_authorized = test_client.post(
+            "/internal/admin/authorize",
+            headers=internal_headers,
+            cookies=admin_cookies,
+            json={"method": "GET"},
+        )
+        assert read_authorized.status_code == 204
+
+        write_without_csrf = test_client.post(
+            "/internal/admin/authorize",
+            headers=internal_headers,
+            cookies=admin_cookies,
+            json={"method": "POST"},
+        )
+        assert write_without_csrf.status_code == 403
+
+        write_authorized = test_client.post(
+            "/internal/admin/authorize",
+            headers={**internal_headers, "X-CSRF-Token": admin_csrf},
+            cookies=admin_cookies,
+            json={"method": "POST"},
+        )
+        assert write_authorized.status_code == 204
+
+
 def test_control_and_chat_routes() -> None:
     with client() as test_client:
         action = test_client.post("/model/start", headers=headers())
