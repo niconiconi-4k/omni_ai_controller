@@ -6,6 +6,8 @@ import hmac
 import ipaddress
 import logging
 import os
+import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +19,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, SecretStr
 
 from .admin import AdminCommandError, AdminController
+from .admin_account_store import (
+    PERMISSIONS, AdminAccountConflict, AdminAccountError, AdminAccountStore,
+)
 from .admin_session import issue_admin_session, validate_admin_csrf, validate_admin_session
 from .client import ServerRequestError
 from .config import ConfigurationError
@@ -119,7 +124,23 @@ class ServiceSettings:
 
 
 class AdminLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
     token: str = Field(min_length=1, max_length=1024)
+
+
+class CreateAdminAccountRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=12, max_length=1024)
+    permissions: list[str] = Field(default_factory=list)
+
+
+class AdminPermissionsRequest(BaseModel):
+    permissions: list[str]
+
+
+class AdminPasswordRequest(BaseModel):
+    password: str = Field(min_length=12, max_length=1024)
 
 
 class ChatMessage(BaseModel):
@@ -186,6 +207,7 @@ def create_app(
     metric_store: MetricStore | None = None,
     vision_settings_store: VisionSettingsStore | None = None,
     vision_client: OpenAIVisionClient | None = None,
+    admin_account_store: AdminAccountStore | None = None,
 ) -> FastAPI:
     active_settings = settings or ServiceSettings.from_environment()
     active_controller = controller or AdminController(
@@ -210,6 +232,14 @@ def create_app(
         active_settings.vision_config_path
     )
     active_vision_client = vision_client or OpenAIVisionClient(active_vision_store)
+    active_admin_accounts = admin_account_store or AdminAccountStore(
+        host=active_settings.database_host,
+        port=active_settings.database_port,
+        database=active_settings.database_name,
+        user=active_settings.database_user,
+        password=active_settings.database_password,
+        secret=active_settings.admin_token,
+    )
     metric_collector = MetricCollector(active_metric_store, hardware_status)
 
     @asynccontextmanager
@@ -248,29 +278,43 @@ def create_app(
             )
         return await call_next(request)
 
-    def require_admin(
-        request: Request,
-        authorization: Annotated[str | None, Header()] = None,
-    ) -> None:
+    def require_admin(request: Request) -> dict[str, object]:
         if not active_settings.admin_token:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin token is not configured")
-        supplied = authorization.removeprefix("Bearer ") if authorization else ""
-        if supplied and hmac.compare_digest(supplied, active_settings.admin_token):
-            return
-        csrf_hash = validate_admin_session(
+        session = validate_admin_session(
             active_settings.admin_token,
             request.cookies.get(ADMIN_SESSION_COOKIE, ""),
         )
-        if csrf_hash is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token")
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid administrator session")
+        try:
+            account = active_admin_accounts.session_account(
+                str(session["account_id"]), int(session["version"])
+            )
+        except AdminAccountError as exc:
+            raise HTTPException(status_code=503, detail="Administrator authentication unavailable") from exc
+        if account is None:
+            raise HTTPException(status_code=401, detail="Administrator account is no longer active")
         if request.method not in {"GET", "HEAD", "OPTIONS"} and not validate_admin_csrf(
-            csrf_hash,
+            str(session["csrf_hash"]),
             request.cookies.get(ADMIN_CSRF_COOKIE, ""),
             request.headers.get("x-csrf-token", ""),
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF validation failed")
+        return account
 
     admin = Depends(require_admin)
+
+    def permission_required(permission: str):  # type: ignore[no-untyped-def]
+        def check(account: dict[str, object] = Depends(require_admin)) -> dict[str, object]:
+            if not account["is_super"] and permission not in account["permissions"]:
+                raise HTTPException(status_code=403, detail="Administrator permission required")
+            return account
+        return Depends(check)
+
+    services_admin = permission_required("services.control")
+    developer_admin = permission_required("quantization.manage")
+    accounts_admin = permission_required("accounts.manage")
 
     def require_vision_internal(
         x_vision_token: Annotated[str | None, Header()] = None,
@@ -293,16 +337,38 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    login_attempts: dict[str, list[float]] = {}
+    login_attempts_lock = threading.Lock()
+
     @application.post("/auth/login")
     def admin_login(payload: AdminLoginRequest, response: Response, request: Request) -> dict[str, str]:
         if not active_settings.admin_token:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Admin token is not configured")
-        if not hmac.compare_digest(payload.token, active_settings.admin_token):
+        attempt_key = f"{_client_ip(request)}:{payload.username.casefold()}"
+        now = time.monotonic()
+        with login_attempts_lock:
+            recent = [item for item in login_attempts.get(attempt_key, []) if now - item < 900]
+            if len(recent) >= 5:
+                raise HTTPException(status_code=429, detail="Too many administrator login attempts")
+            if len(login_attempts) > 4096:
+                login_attempts.clear()
+            login_attempts[attempt_key] = recent
+        try:
+            account = active_admin_accounts.authenticate(payload.username, payload.password, payload.token)
+        except AdminAccountError as exc:
+            raise HTTPException(status_code=503, detail="Administrator authentication unavailable") from exc
+        if account is None:
+            with login_attempts_lock:
+                login_attempts.setdefault(attempt_key, []).append(time.monotonic())
             LOGGER.warning("admin login failed client=%s", _client_ip(request))
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid administrator credentials")
+        with login_attempts_lock:
+            login_attempts.pop(attempt_key, None)
         session_token, csrf_token = issue_admin_session(
             active_settings.admin_token,
             active_settings.admin_session_ttl_hours,
+            str(account["id"]),
+            int(account["auth_version"]),
         )
         max_age = active_settings.admin_session_ttl_hours * 3600
         response.set_cookie(
@@ -331,8 +397,13 @@ def create_app(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.get("/auth/session", dependencies=[admin])
-    def admin_session(request: Request) -> dict[str, str]:
-        return {"csrf_token": request.cookies.get(ADMIN_CSRF_COOKIE, "")}
+    def admin_session(request: Request, account: dict[str, object] = Depends(require_admin)) -> dict[str, object]:
+        return {
+            "csrf_token": request.cookies.get(ADMIN_CSRF_COOKIE, ""),
+            "username": account["username"],
+            "permissions": list(PERMISSIONS) if account["is_super"] else account["permissions"],
+            "is_super": account["is_super"],
+        }
 
     @application.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT, dependencies=[admin])
     def admin_logout() -> Response:
@@ -341,11 +412,70 @@ def create_app(
         response.delete_cookie(ADMIN_CSRF_COOKIE, path="/", secure=True, httponly=False, samesite="strict")
         return response
 
-    @application.get("/overview", dependencies=[admin])
+    def account_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, AdminAccountConflict):
+            return HTTPException(status_code=409, detail=str(exc))
+        if isinstance(exc, ValueError):
+            return HTTPException(status_code=422, detail=str(exc))
+        return HTTPException(status_code=503, detail="Administrator account storage unavailable")
+
+    @application.get("/admin/permissions", dependencies=[accounts_admin])
+    def admin_permissions() -> dict[str, object]:
+        return {"items": list(PERMISSIONS)}
+
+    @application.get("/admin/accounts", dependencies=[accounts_admin])
+    def list_admin_accounts() -> dict[str, object]:
+        try:
+            return {"items": active_admin_accounts.list_accounts()}
+        except AdminAccountError as exc:
+            raise account_error(exc) from exc
+
+    @application.post("/admin/accounts", status_code=201, dependencies=[accounts_admin])
+    def create_admin_account(payload: CreateAdminAccountRequest, response: Response) -> dict[str, object]:
+        try:
+            created = active_admin_accounts.create(payload.username, payload.password, payload.permissions)
+            response.headers["Cache-Control"] = "no-store"
+            return created
+        except (AdminAccountError, ValueError) as exc:
+            raise account_error(exc) from exc
+
+    @application.put("/admin/accounts/{account_id}/permissions", dependencies=[accounts_admin])
+    def update_admin_permissions(account_id: str, payload: AdminPermissionsRequest) -> dict[str, object]:
+        try:
+            return {"account": active_admin_accounts.update_permissions(account_id, payload.permissions)}
+        except (AdminAccountError, ValueError) as exc:
+            raise account_error(exc) from exc
+
+    @application.post("/admin/accounts/{account_id}/token", dependencies=[accounts_admin])
+    def rotate_admin_token(account_id: str, response: Response) -> dict[str, str]:
+        try:
+            result = active_admin_accounts.rotate_token(account_id)
+            response.headers["Cache-Control"] = "no-store"
+            return result
+        except AdminAccountError as exc:
+            raise account_error(exc) from exc
+
+    @application.put("/admin/accounts/{account_id}/password", dependencies=[accounts_admin])
+    def reset_admin_password(account_id: str, payload: AdminPasswordRequest) -> dict[str, str]:
+        try:
+            active_admin_accounts.update_password(account_id, payload.password)
+            return {"status": "ok"}
+        except (AdminAccountError, ValueError) as exc:
+            raise account_error(exc) from exc
+
+    @application.delete("/admin/accounts/{account_id}", status_code=204, dependencies=[accounts_admin])
+    def delete_admin_account(account_id: str) -> Response:
+        try:
+            active_admin_accounts.delete(account_id)
+            return Response(status_code=204)
+        except AdminAccountError as exc:
+            raise account_error(exc) from exc
+
+    @application.get("/overview", dependencies=[services_admin])
     def overview() -> dict[str, object]:
         return active_controller.overview()
 
-    @application.get("/vision/settings", dependencies=[admin])
+    @application.get("/vision/settings", dependencies=[developer_admin])
     def get_vision_settings() -> dict[str, object]:
         try:
             return active_vision_store.status()
@@ -355,7 +485,7 @@ def create_app(
                 detail=str(exc),
             ) from exc
 
-    @application.put("/vision/settings", dependencies=[admin])
+    @application.put("/vision/settings", dependencies=[developer_admin])
     def update_vision_settings(payload: VisionSettingsUpdate) -> dict[str, object]:
         try:
             return active_vision_store.save(
@@ -368,7 +498,7 @@ def create_app(
                 detail=str(exc),
             ) from exc
 
-    @application.delete("/vision/settings/key", dependencies=[admin])
+    @application.delete("/vision/settings/key", dependencies=[developer_admin])
     def delete_vision_key() -> dict[str, object]:
         try:
             return active_vision_store.remove_key()
@@ -426,18 +556,26 @@ def create_app(
     @application.post("/internal/admin/authorize", dependencies=[vision_internal])
     def authorize_internal_admin(
         payload: InternalAdminAuthorizationRequest, request: Request
-    ) -> Response:
-        csrf_hash = validate_admin_session(
+    ) -> dict[str, object]:
+        session = validate_admin_session(
             active_settings.admin_token,
             request.cookies.get(ADMIN_SESSION_COOKIE, ""),
         )
-        if csrf_hash is None:
+        if session is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid admin token",
+                detail="Invalid administrator session",
             )
+        try:
+            account = active_admin_accounts.session_account(
+                str(session["account_id"]), int(session["version"])
+            )
+        except AdminAccountError as exc:
+            raise HTTPException(status_code=503, detail="Administrator authentication unavailable") from exc
+        if account is None:
+            raise HTTPException(status_code=401, detail="Administrator account is no longer active")
         if payload.method not in {"GET", "HEAD", "OPTIONS"} and not validate_admin_csrf(
-            csrf_hash,
+            str(session["csrf_hash"]),
             request.cookies.get(ADMIN_CSRF_COOKIE, ""),
             request.headers.get("x-csrf-token", ""),
         ):
@@ -445,9 +583,14 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="CSRF validation failed",
             )
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return {
+            "id": account["id"],
+            "username": account["username"],
+            "is_super": account["is_super"],
+            "permissions": list(PERMISSIONS) if account["is_super"] else account["permissions"],
+        }
 
-    @application.get("/metrics/history", dependencies=[admin])
+    @application.get("/metrics/history", dependencies=[services_admin])
     def metric_history(
         metric: MetricName,
         range_name: Annotated[MetricRange, Query(alias="range")] = "5m",
@@ -461,7 +604,7 @@ def create_app(
                 detail=str(exc),
             ) from exc
 
-    @application.post("/model/{action}", dependencies=[admin])
+    @application.post("/model/{action}", dependencies=[services_admin])
     def model_action(action: Literal["start", "stop", "restart"], request: Request) -> dict[str, object]:
         LOGGER.warning("model action=%s client=%s", action, _client_ip(request))
         try:
@@ -469,7 +612,7 @@ def create_app(
         except (AdminCommandError, ConfigurationError, ServerRequestError) as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
-    @application.post("/containers/{name}/{action}", dependencies=[admin])
+    @application.post("/containers/{name}/{action}", dependencies=[services_admin])
     def container_action(
         name: str,
         action: Literal["start", "stop", "restart"],
@@ -481,7 +624,7 @@ def create_app(
         except AdminCommandError as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
-    @application.get("/containers/{name}/logs", dependencies=[admin])
+    @application.get("/containers/{name}/logs", dependencies=[services_admin])
     def container_logs(
         name: str,
         tail: Annotated[int, Query(ge=1, le=500)] = 120,
@@ -505,14 +648,14 @@ def create_app(
             detail=str(exc),
         )
 
-    @application.get("/conversations", dependencies=[admin])
+    @application.get("/conversations", dependencies=[developer_admin])
     def list_conversations() -> dict[str, object]:
         try:
             return {"items": active_conversation_store.list_conversations()}
         except ConversationStoreError as exc:
             raise conversation_http_error(exc) from exc
 
-    @application.post("/conversations", status_code=status.HTTP_201_CREATED, dependencies=[admin])
+    @application.post("/conversations", status_code=status.HTTP_201_CREATED, dependencies=[developer_admin])
     def create_conversation(payload: CreateConversationRequest) -> dict[str, object]:
         title = payload.title.strip()
         if not title:
@@ -527,14 +670,14 @@ def create_app(
         except ConversationStoreError as exc:
             raise conversation_http_error(exc) from exc
 
-    @application.get("/conversations/{conversation_id}", dependencies=[admin])
+    @application.get("/conversations/{conversation_id}", dependencies=[developer_admin])
     def get_conversation(conversation_id: str) -> dict[str, object]:
         try:
             return {"conversation": active_conversation_store.get_conversation(conversation_id)}
         except ConversationStoreError as exc:
             raise conversation_http_error(exc) from exc
 
-    @application.patch("/conversations/{conversation_id}", dependencies=[admin])
+    @application.patch("/conversations/{conversation_id}", dependencies=[developer_admin])
     def rename_conversation(
         conversation_id: str,
         payload: RenameConversationRequest,
@@ -551,7 +694,7 @@ def create_app(
     @application.delete(
         "/conversations/{conversation_id}",
         status_code=status.HTTP_204_NO_CONTENT,
-        dependencies=[admin],
+        dependencies=[developer_admin],
     )
     def delete_conversation(conversation_id: str) -> Response:
         try:
@@ -560,7 +703,7 @@ def create_app(
         except ConversationStoreError as exc:
             raise conversation_http_error(exc) from exc
 
-    @application.post("/conversations/{conversation_id}/chat", dependencies=[admin])
+    @application.post("/conversations/{conversation_id}/chat", dependencies=[developer_admin])
     def chat_in_conversation(
         conversation_id: str,
         payload: ConversationChatRequest,
@@ -601,7 +744,7 @@ def create_app(
             "assistant_message": assistant_message,
         }
 
-    @application.post("/chat", dependencies=[admin])
+    @application.post("/chat", dependencies=[developer_admin])
     def chat(payload: ChatRequest) -> dict[str, str]:
         active_controller.model_server.refresh()
         try:

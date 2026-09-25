@@ -4,7 +4,51 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from omni_ai_controller.admin_account_store import PERMISSIONS, AdminAccountConflict
 from omni_ai_controller.service import ServiceSettings, create_app
+
+
+class FakeAdminAccountStore:
+    def __init__(self) -> None:
+        self.accounts: dict[str, dict[str, object]] = {
+            "super": {"id": "super", "username": "Mutsu", "is_super": True,
+                      "permissions": list(PERMISSIONS), "auth_version": 1},
+        }
+
+    def authenticate(self, username: str, password: str, token: str):  # type: ignore[no-untyped-def]
+        if username == "Mutsu" and password == "test-password-123" and token == "test-personal-token":
+            return self.accounts["super"]
+        if username == "limited" and password == "limited-password-123" and token == "limited-token":
+            return self.accounts.get("limited")
+        return None
+
+    def session_account(self, account_id: str, version: int):  # type: ignore[no-untyped-def]
+        account = self.accounts.get(account_id)
+        return account if account and account["auth_version"] == version else None
+
+    def list_accounts(self):  # type: ignore[no-untyped-def]
+        return [account for key, account in self.accounts.items() if key != "super"]
+
+    def create(self, username: str, password: str, permissions: list[str]):  # type: ignore[no-untyped-def]
+        if username == "Mutsu":
+            raise ValueError("Immutable")
+        account = {"id": username, "username": username, "is_super": False,
+                   "permissions": permissions, "auth_version": 1}
+        self.accounts[username] = account
+        return {"account": account, "token": "one-time-generated-token"}
+
+    def update_permissions(self, account_id: str, permissions: list[str]):  # type: ignore[no-untyped-def]
+        if account_id == "super":
+            raise AdminAccountConflict("Immutable")
+        account = self.accounts[account_id]
+        account["permissions"] = permissions
+        account["auth_version"] = int(account["auth_version"]) + 1
+        return account
+
+    def delete(self, account_id: str) -> None:
+        if account_id == "super":
+            raise AdminAccountConflict("Immutable")
+        del self.accounts[account_id]
 
 
 class FakeController:
@@ -184,7 +228,7 @@ class FakeVisionClient:
         }
 
 
-def client(controller: FakeController | None = None) -> TestClient:
+def client(controller: FakeController | None = None, store: FakeAdminAccountStore | None = None) -> TestClient:
     settings = ServiceSettings(
         model_dir=Path("/tmp/model"),
         admin_token="secret-token",
@@ -194,7 +238,7 @@ def client(controller: FakeController | None = None) -> TestClient:
         vision_config_path=Path("/tmp/test-openai-vision.json"),
         vision_internal_token="internal-vision-token",
     )
-    return TestClient(
+    test_client = TestClient(
         create_app(
             settings,
             controller or FakeController(),
@@ -202,28 +246,35 @@ def client(controller: FakeController | None = None) -> TestClient:
             FakeMetricStore(),
             FakeVisionStore(),
             FakeVisionClient(),
+            admin_account_store=store or FakeAdminAccountStore(),
         ),  # type: ignore[arg-type]
         base_url="https://testserver",
     )
+    login = test_client.post("/auth/login", headers={"X-Forwarded-For": "192.168.192.10"},
+        json={"username": "Mutsu", "password": "test-password-123", "token": "test-personal-token"})
+    assert login.status_code == 200
+    global TEST_CSRF
+    TEST_CSRF = login.json()["csrf_token"]
+    return test_client
 
 
+TEST_CSRF = ""
 def headers(token: str = "secret-token", ip: str = "192.168.192.10") -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}", "X-Forwarded-For": ip}
+    return {"Authorization": f"Bearer {token}", "X-Forwarded-For": ip, "X-CSRF-Token": TEST_CSRF}
 
 
-def test_overview_requires_network_and_token() -> None:
+def test_overview_requires_network_and_session() -> None:
     with client() as test_client:
         assert test_client.get("/overview", headers=headers()).status_code == 200
-        assert test_client.get("/overview", headers=headers(token="wrong")).status_code == 401
+        assert test_client.get("/overview", headers=headers(token="wrong")).status_code == 200
         assert test_client.get("/overview", headers=headers(ip="192.168.50.10")).status_code == 403
+        test_client.cookies.clear()
+        assert test_client.get("/overview", headers=headers()).status_code == 401
 
 
 def test_metric_history_is_authenticated_and_validated() -> None:
     with client() as test_client:
-        assert test_client.get(
-            "/metrics/history?metric=cpu&range=1d",
-            headers=headers(token="wrong"),
-        ).status_code == 401
+        assert test_client.get("/metrics/history?metric=cpu&range=1d", headers=headers(token="wrong")).status_code == 200
 
         response = test_client.get(
             "/metrics/history?metric=cpu&range=1d",
@@ -242,7 +293,7 @@ def test_metric_history_is_authenticated_and_validated() -> None:
 
 def test_vision_settings_and_internal_proxy_are_protected() -> None:
     with client() as test_client:
-        assert test_client.get("/vision/settings", headers=headers(token="wrong")).status_code == 401
+        assert test_client.get("/vision/settings", headers=headers(token="wrong")).status_code == 200
         settings = test_client.get("/vision/settings", headers=headers())
         assert settings.status_code == 200
         assert settings.json()["configured"] is False
@@ -318,7 +369,7 @@ def test_internal_admin_authorization_requires_admin_session_and_csrf() -> None:
         login = test_client.post(
             "/auth/login",
             headers=headers(),
-            json={"token": "secret-token"},
+            json={"username": "Mutsu", "password": "test-password-123", "token": "test-personal-token"},
         )
         assert login.status_code == 200
         admin_csrf = login.json()["csrf_token"]
@@ -342,7 +393,8 @@ def test_internal_admin_authorization_requires_admin_session_and_csrf() -> None:
             cookies=admin_cookies,
             json={"method": "GET"},
         )
-        assert read_authorized.status_code == 204
+        assert read_authorized.status_code == 200
+        assert read_authorized.json()["is_super"] is True
 
         write_without_csrf = test_client.post(
             "/internal/admin/authorize",
@@ -358,7 +410,7 @@ def test_internal_admin_authorization_requires_admin_session_and_csrf() -> None:
             cookies=admin_cookies,
             json={"method": "POST"},
         )
-        assert write_authorized.status_code == 204
+        assert write_authorized.status_code == 200
 
 
 def test_control_and_chat_routes() -> None:
@@ -424,14 +476,14 @@ def test_browser_admin_session_requires_key_and_csrf() -> None:
         rejected = test_client.post(
             "/auth/login",
             headers=network_headers,
-            json={"token": "wrong"},
+            json={"username": "Mutsu", "password": "test-password-123", "token": "wrong"},
         )
         assert rejected.status_code == 401
 
         login = test_client.post(
             "/auth/login",
             headers=network_headers,
-            json={"token": "secret-token"},
+            json={"username": "Mutsu", "password": "test-password-123", "token": "test-personal-token"},
         )
         assert login.status_code == 200
         csrf_token = login.json()["csrf_token"]
@@ -454,3 +506,30 @@ def test_browser_admin_session_requires_key_and_csrf() -> None:
         logout = test_client.post("/auth/logout", headers=action_headers)
         assert logout.status_code == 204
         assert test_client.get("/auth/check", headers=network_headers).status_code == 401
+
+
+def test_admin_account_permissions_and_revocation() -> None:
+    store = FakeAdminAccountStore()
+    with client(store=store) as test_client:
+        assert test_client.get("/admin/accounts", headers=headers()).json()["items"] == []
+        assert test_client.delete("/admin/accounts/super", headers=headers()).status_code == 409
+        created = test_client.post("/admin/accounts", headers=headers(),
+            json={"username": "limited", "password": "limited-password-123", "permissions": ["support.manage"]})
+        assert created.status_code == 201
+        assert created.json()["token"] == "one-time-generated-token"
+        assert [item["username"] for item in test_client.get("/admin/accounts", headers=headers()).json()["items"]] == ["limited"]
+        login = test_client.post("/auth/login", headers=headers(),
+            json={"username": "limited", "password": "limited-password-123", "token": "limited-token"})
+        assert login.status_code == 200
+        assert test_client.get("/overview", headers=headers()).status_code == 403
+        assert test_client.get("/vision/settings", headers=headers()).status_code == 403
+        assert test_client.get("/admin/accounts", headers=headers()).status_code == 403
+        assert test_client.get("/auth/session", headers=headers()).json()["permissions"] == ["support.manage"]
+        store.update_permissions("limited", ["services.control"])
+        assert test_client.get("/auth/check", headers=headers()).status_code == 401
+        login = test_client.post("/auth/login", headers=headers(),
+            json={"username": "limited", "password": "limited-password-123", "token": "limited-token"})
+        assert login.status_code == 200
+        assert test_client.get("/overview", headers=headers()).status_code == 200
+        store.delete("limited")
+        assert test_client.get("/auth/check", headers=headers()).status_code == 401

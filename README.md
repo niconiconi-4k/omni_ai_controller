@@ -91,7 +91,7 @@ omni-ai-controller
 
 ## 安装宿主机控制服务
 
-控制服务必须运行在宿主机上，以读取真实硬件状态并控制 Docker。安装脚本会创建独立虚拟环境、生成管理员令牌，并注册开机自动启动的 systemd 服务：
+控制服务必须运行在宿主机上，以读取真实硬件状态并控制 Docker。安装脚本会创建独立虚拟环境、生成仅用于会话签名及散列加盐的内部密钥，并注册开机自动启动的 systemd 服务：
 
 ```bash
 cd /opt/ai_server/omni_ai_controller
@@ -99,7 +99,11 @@ chmod +x scripts/install-service.sh
 bash scripts/install-service.sh
 ```
 
-服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。管理员令牌不会由安装脚本打印；服务器管理员从该文件中取得令牌，并在独立的 `/admin-login/` 页面完成认证。控制器验证密钥后签发 12 小时有效的 HMAC 管理员会话和 CSRF token，原始管理员密钥不会写入 Cookie、网页存储或前端日志。
+服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。其中的 `OMNI_ADMIN_TOKEN` 只用于服务端 HMAC 签名，不可直接登录。管理员必须使用独立的用户名、密码和个人 token 登录 `/admin-login/`；密码以 Argon2id 散列保存，个人 token 只存 HMAC 散列，首次创建或重置时仅显示一次。会话绑定账号和授权版本，删除、重置或调整权限后旧会话立即失效。固定超级管理员 Mutsu 的信息由数据库触发器保护，不在账户列表显示，并自动拥有现有及将来的全部权限。
+
+部署前先在数据库项目运行第 012 号迁移，再安装控制器，并由有 sudo 权限的维护者执行 `sudo /opt/omni-ai-controller/venv/bin/python scripts/bootstrap-admin.py`。脚本仅通过交互式终端读取初始密码，不将其写入脚本、命令行或数据库明文；生成的个人 token 仅在终端显示一次。此账号一经创建，不支持修改密码、轮换 token 或删除，因此务必妥善保管个人 token。
+
+五项独立权限为 `accounts.manage`（增删账号及分配权限）、`services.control`（Docker、模型和硬件）、`business.manage`（跨公司文件管理）、`support.manage`（客服）、`quantization.manage`（开发者实验室）。未经许可的路由返回 403；仅有客服或账户权限的管理员无需加载服务和量化接口。
 
 Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` 表。数据库只在宿主机回环地址 `127.0.0.1:15432` 为 Controller 提供连接，不向局域网或公网开放。Controller 从 `/var/lib/omni-ai/config/database.env` 读取数据库凭据；该文件不得提交到 Git 或输出到日志。
 

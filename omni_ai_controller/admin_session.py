@@ -16,11 +16,13 @@ def _decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def issue_admin_session(secret: str, ttl_hours: int) -> tuple[str, str]:
+def issue_admin_session(secret: str, ttl_hours: int, account_id: str, version: int) -> tuple[str, str]:
     csrf_token = secrets.token_urlsafe(32)
     payload = {
         "expires_at": int(time.time()) + ttl_hours * 3600,
         "csrf_hash": hashlib.sha256(csrf_token.encode("utf-8")).hexdigest(),
+        "account_id": account_id,
+        "version": version,
         "nonce": secrets.token_urlsafe(16),
     }
     body = _encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
@@ -30,7 +32,7 @@ def issue_admin_session(secret: str, ttl_hours: int) -> tuple[str, str]:
     return f"{body}.{signature}", csrf_token
 
 
-def validate_admin_session(secret: str, token: str) -> str | None:
+def validate_admin_session(secret: str, token: str) -> dict[str, str | int] | None:
     if not secret or not token:
         return None
     try:
@@ -46,9 +48,11 @@ def validate_admin_session(secret: str, token: str) -> str | None:
         if int(payload["expires_at"]) <= int(time.time()):
             return None
         csrf_hash = str(payload["csrf_hash"])
-        if len(csrf_hash) != 64:
+        account_id = str(payload["account_id"])
+        version = int(payload["version"])
+        if len(csrf_hash) != 64 or not account_id or version < 1:
             return None
-        return csrf_hash
+        return {"csrf_hash": csrf_hash, "account_id": account_id, "version": version}
     except (ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
 

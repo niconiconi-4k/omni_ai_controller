@@ -76,5 +76,5 @@ systemctl enable omni-ai-controller.service
 systemctl restart omni-ai-controller.service
 systemctl --no-pager --full status omni-ai-controller.service
 
-printf '\nAdmin token is stored in %s (mode 0600).\n' "${config_file}"
-printf 'For security it is not printed by this installer.\n'
+printf '\nInternal session signing secret is stored in %s (mode 0600).\n' "${config_file}"
+printf 'It cannot be used for administrator login; personal tokens are issued by the administrator account store.\n'
