@@ -26,6 +26,11 @@ class FakeAdminAccountStore:
         account = self.accounts.get(account_id)
         return account if account and account["auth_version"] == version else None
 
+    def verify_current_password(self, account_id: str, username: str, password: str) -> bool:
+        account = self.accounts.get(account_id)
+        return bool(account and account["username"].casefold() == username.strip().casefold()
+                    and password == ("test-password-123" if account_id == "super" else "limited-password-123"))
+
     def list_accounts(self):  # type: ignore[no-untyped-def]
         return [account for key, account in self.accounts.items() if key != "super"]
 
@@ -270,6 +275,41 @@ def test_overview_requires_network_and_session() -> None:
         assert test_client.get("/overview", headers=headers(ip="192.168.50.10")).status_code == 403
         test_client.cookies.clear()
         assert test_client.get("/overview", headers=headers()).status_code == 401
+
+
+def test_lab_reset_confirmation_requires_current_admin_password() -> None:
+    path = "/internal/admin/confirm-password"
+    auth = {"X-Vision-Token": "internal-vision-token", "X-CSRF-Token": ""}
+    body = {"account_id": "super", "username": "Mutsu", "password": "test-password-123"}
+    with client() as test_client:
+        auth["X-CSRF-Token"] = TEST_CSRF
+        assert test_client.post(path, json=body).status_code == 401
+        assert test_client.post(path, headers={"X-Vision-Token": "wrong", "X-CSRF-Token": TEST_CSRF}, json=body).status_code == 401
+        assert test_client.post(path, headers={"X-Vision-Token": "internal-vision-token"}, json=body).status_code == 403
+        assert test_client.post(path, headers=auth, json={**body, "account_id": "other"}).status_code == 401
+        assert test_client.post(path, headers=auth, json={**body, "username": "other"}).status_code == 401
+        assert test_client.post(path, headers=auth, json={**body, "password": "incorrect"}).status_code == 401
+        assert test_client.post(path, headers=auth, json=body).status_code == 204
+
+
+def test_lab_reset_confirmation_is_permission_scoped_and_rate_limited() -> None:
+    store = FakeAdminAccountStore()
+    store.accounts["limited"] = {
+        "id": "limited", "username": "limited", "is_super": False,
+        "permissions": ["business.manage"], "auth_version": 1,
+    }
+    path = "/internal/admin/confirm-password"
+    with client(store=store) as test_client:
+        login = test_client.post("/auth/login", headers={"X-Forwarded-For": "192.168.192.10"},
+                                 json={"username": "limited", "password": "limited-password-123", "token": "limited-token"})
+        assert login.status_code == 200
+        auth = {"X-Vision-Token": "internal-vision-token", "X-CSRF-Token": login.json()["csrf_token"]}
+        body = {"account_id": "limited", "username": "limited", "password": "limited-password-123"}
+        assert test_client.post(path, headers=auth, json=body).status_code == 403
+        store.accounts["limited"]["permissions"] = ["quantization.manage"]
+        for _ in range(5):
+            assert test_client.post(path, headers=auth, json=body | {"password": "wrong"}).status_code == 401
+        assert test_client.post(path, headers=auth, json=body).status_code == 429
 
 
 def test_metric_history_is_authenticated_and_validated() -> None:

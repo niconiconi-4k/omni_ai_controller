@@ -191,6 +191,12 @@ class InternalAdminAuthorizationRequest(BaseModel):
     method: Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
 
 
+class InternalAdminPasswordConfirmation(BaseModel):
+    account_id: str = Field(min_length=1, max_length=128)
+    username: str = Field(min_length=1, max_length=128)
+    password: SecretStr
+
+
 def _client_ip(request: Request) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
     candidate = forwarded or (request.client.host if request.client else "")
@@ -268,6 +274,7 @@ def create_app(
             "/internal/vision/receipts",
             "/internal/support/chat",
             "/internal/admin/authorize",
+            "/internal/admin/confirm-password",
         }:
             return await call_next(request)
         address = _client_ip(request)
@@ -589,6 +596,36 @@ def create_app(
             "is_super": account["is_super"],
             "permissions": list(PERMISSIONS) if account["is_super"] else account["permissions"],
         }
+
+    @application.post("/internal/admin/confirm-password", status_code=204, dependencies=[vision_internal])
+    def confirm_admin_password(
+        payload: InternalAdminPasswordConfirmation, request: Request,
+    ) -> Response:
+        account = require_admin(request)
+        if not hmac.compare_digest(str(account["id"]), payload.account_id):
+            raise HTTPException(status_code=401, detail="Administrator identity mismatch")
+        if not account["is_super"] and "quantization.manage" not in account["permissions"]:
+            raise HTTPException(status_code=403, detail="Administrator permission required")
+        attempt_key = f"lab-reset:{account['id']}"
+        now = time.monotonic()
+        with login_attempts_lock:
+            recent = [item for item in login_attempts.get(attempt_key, []) if now - item < 900]
+            if len(recent) >= 5:
+                raise HTTPException(status_code=429, detail="Too many confirmation attempts")
+            login_attempts[attempt_key] = recent
+        try:
+            valid = active_admin_accounts.verify_current_password(
+                str(account["id"]), payload.username, payload.password.get_secret_value()
+            )
+        except AdminAccountError as exc:
+            raise HTTPException(status_code=503, detail="Administrator authentication unavailable") from exc
+        if not valid:
+            with login_attempts_lock:
+                login_attempts.setdefault(attempt_key, []).append(time.monotonic())
+            raise HTTPException(status_code=401, detail="当前账号或密码不正确")
+        with login_attempts_lock:
+            login_attempts.pop(attempt_key, None)
+        return Response(status_code=204)
 
     @application.get("/metrics/history", dependencies=[services_admin])
     def metric_history(

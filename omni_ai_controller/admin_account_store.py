@@ -144,6 +144,27 @@ class AdminAccountStore:
         except (ValueError, psycopg.Error) as exc:
             raise AdminAccountError("Unable to validate administrator session") from exc
 
+    def verify_current_password(self, account_id: str, username: str, password: str) -> bool:
+        try:
+            with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(
+                    "SELECT username, password_hash, locked_until FROM controller_admin_accounts WHERE id = %s",
+                    (account_id,),
+                )
+                account = cursor.fetchone()
+                if account is None:
+                    self._verify_password(self.dummy_hash, password)
+                    return False
+                valid_password = self._verify_password(account["password_hash"], password)
+                valid_username = hmac.compare_digest(
+                    account["username"].casefold().encode(), username.strip().casefold().encode()
+                )
+                return bool(valid_password & valid_username) and not (
+                    account["locked_until"] and account["locked_until"] > datetime.now(timezone.utc)
+                )
+        except psycopg.Error as exc:
+            raise AdminAccountError("Unable to confirm administrator password") from exc
+
     def list_accounts(self) -> list[dict[str, Any]]:
         try:
             with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:
