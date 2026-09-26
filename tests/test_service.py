@@ -222,11 +222,18 @@ class FakeVisionStore:
 
 
 class FakeVisionClient:
-    def recognize(self, image: bytes, *, filename: str, content_type: str) -> dict[str, object]:
+    def recognize(
+        self,
+        image: bytes,
+        *,
+        filename: str,
+        content_type: str,
+        model_override: str | None = None,
+    ) -> dict[str, object]:
         return {
             "request_id": "vision-1",
             "status": "accepted",
-            "model": {"provider": "openai", "vision": "gpt-4o"},
+            "model": {"provider": "openai", "vision": model_override or "gpt-4o"},
             "receipts": [{"index": 1, "text": filename, "payment_candidates": []}],
             "size": len(image),
             "content_type": content_type,
@@ -374,10 +381,12 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
                 "filename": "receipt.png",
                 "content_type": "image/png",
                 "image_base64": base64.b64encode(b"image").decode("ascii"),
+                "model": "gpt-6-sol",
             },
         )
         assert analyzed.status_code == 200
         assert analyzed.json()["request_id"] == "vision-1"
+        assert analyzed.json()["model"]["vision"] == "gpt-6-sol"
 
 
 def test_internal_support_chat_uses_fixed_system_prompt() -> None:

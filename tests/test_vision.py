@@ -90,6 +90,24 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
                                     "confidence": 0.98,
                                 }
                             ],
+                            "financial_facts": {
+                                "amount_text": "123,45 SEK",
+                                "amount_decimal": "123.45",
+                                "currency": "SEK",
+                                "reference_numbers": ["RF18 5390"],
+                                "account_numbers": ["**** 4242"],
+                                "transaction_time_text": "2026-09-26 10:00",
+                                "transaction_time_iso": "2026-09-26T10:00:00+02:00",
+                                "payer": {"name": "Buyer AB", "organization_number": "556000-0001"},
+                                "payee": {"name": "Seller AB", "organization_number": "556000-0002"},
+                            },
+                            "classification": {
+                                "document_type": "expense_voucher",
+                                "is_certain": True,
+                                "confidence": 0.97,
+                                "reason": "供应商发票",
+                                "evidence": ["Invoice", "Amount due"],
+                            },
                         }
                     )
                 }
@@ -116,9 +134,16 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
     assert result["usage"]["completion_tokens"] == 20
     assert result["usage"]["prompt_tokens_details"]["cached_tokens"] == 10
     assert result["receipts"][0]["payment_candidates"][0]["amounts"] == ["123,45"]
+    assert result["financial_facts"]["account_numbers"] == ["**** 4242"]
+    assert result["classification"]["document_type"] == "expense_voucher"
     sent_request = request.call_args.args[0]
+    sent_payload = json.loads(sent_request.data.decode("utf-8"))
     assert sent_request.full_url == "https://api.openai.com/v1/chat/completions"
     assert sent_request.get_header("Authorization").startswith("Bearer sk-test-")
+    schema = sent_payload["response_format"]["json_schema"]["schema"]
+    assert "financial_facts" in schema["properties"]
+    assert "classification" in schema["properties"]
+    assert "bank_voucher" not in schema["properties"]["classification"]["properties"]["document_type"]["enum"]
 
 
 def test_openai_vision_requires_configuration(tmp_path: Path) -> None:
@@ -130,7 +155,7 @@ def test_openai_vision_requires_configuration(tmp_path: Path) -> None:
 
 def test_gpt_6_sol_uses_compatible_chat_completion_parameters(tmp_path: Path) -> None:
     store = VisionSettingsStore(tmp_path / "vision.json")
-    store.save(model="gpt-6-sol", api_key="sk-test-012345678901234567890")
+    store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
     response = {
         "id": "request-sol-1",
         "model": "gpt-6-sol",
@@ -143,7 +168,10 @@ def test_gpt_6_sol_uses_compatible_chat_completion_parameters(tmp_path: Path) ->
 
     with patch("omni_ai_controller.vision.urlopen", return_value=FakeResponse(response)) as request:
         result = OpenAIVisionClient(store).recognize(
-            b"image-bytes", filename="receipt.png", content_type="image/png"
+            b"image-bytes",
+            filename="receipt.png",
+            content_type="image/png",
+            model_override="gpt-6-sol",
         )
 
     sent_payload = json.loads(request.call_args.args[0].data.decode("utf-8"))

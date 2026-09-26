@@ -31,6 +31,13 @@ SUPPORTED_VISION_MODELS: dict[str, dict[str, object]] = {
 DEFAULT_VISION_MODEL = "gpt-4o"
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 MAX_VISION_IMAGE_BYTES = 20 * 1024 * 1024
+RECEIPT_DOCUMENT_TYPES = (
+    "income_voucher",
+    "expense_voucher",
+    "payroll_voucher",
+    "loan_interest_voucher",
+    "tax_voucher",
+)
 
 
 class VisionSettingsError(RuntimeError):
@@ -158,12 +165,16 @@ class OpenAIVisionClient:
         *,
         filename: str,
         content_type: str,
+        model_override: str | None = None,
     ) -> dict[str, Any]:
         if content_type not in {"image/jpeg", "image/png", "image/webp"}:
             raise VisionRequestError("OpenAI 识图仅支持 JPEG、PNG 和 WebP", status_code=415)
         if not image or len(image) > MAX_VISION_IMAGE_BYTES:
             raise VisionRequestError("图片必须介于 1 字节和 20 MiB 之间", status_code=413)
-        model, api_key = self.settings.credentials()
+        configured_model, api_key = self.settings.credentials()
+        model = model_override or configured_model
+        if model not in SUPPORTED_VISION_MODELS:
+            raise VisionRequestError("不支持该 OpenAI 识图模型", status_code=422)
         encoded = base64.b64encode(image).decode("ascii")
         payload = {
             "model": model,
@@ -174,10 +185,21 @@ class OpenAIVisionClient:
                         {
                             "type": "text",
                             "text": (
-                                "Analyze this financial receipt or invoice. Extract all visible text and "
-                                "identify the final amount actually paid or payable. Currency may be SEK, "
-                                "EUR, USD, CNY or another ISO currency. Do not invent unreadable values. "
-                                "Return only data matching the supplied JSON schema."
+                                "Analyze exactly one financial document shown in this image. Preserve all "
+                                "visible text and extract facts without guessing. Masked account/card numbers "
+                                "must retain every visible '*' and digit exactly. Extract the final paid or "
+                                "payable amount, ISO currency when visible, reference/OCR/payment identifiers, "
+                                "account or card numbers, transaction time, and payer/payee company names and "
+                                "organization/tax numbers. Classify only when the visual evidence is strong: "
+                                "income_voucher = sales invoice, POS/Z report, or credit invoice/Kreditfaktura; "
+                                "expense_voucher = supplier invoice, purchase receipt, or travel reimbursement; "
+                                "payroll_voucher = payslip or employer declaration; loan_interest_voucher = bank "
+                                "loan, repayment, interest, or bank-fee document; tax_voucher = VAT return, tax, "
+                                "customs, import, or export document. Never return bank_voucher or uncategorized. "
+                                "Set classification.is_certain=true only when one category is unambiguous and "
+                                "confidence is at least 0.85; otherwise return document_type=null and "
+                                "status=needs_manual_confirmation. Use needs_reupload only when image quality "
+                                "prevents reliable reading. Return only data matching the supplied JSON schema."
                             ),
                         },
                         {
@@ -220,8 +242,75 @@ class OpenAIVisionClient:
                                     "required": ["text", "amount", "currency", "keyword", "confidence"],
                                 },
                             },
+                            "financial_facts": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "amount_text": {"type": ["string", "null"]},
+                                    "amount_decimal": {"type": ["string", "null"]},
+                                    "currency": {"type": ["string", "null"]},
+                                    "reference_numbers": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "account_numbers": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "transaction_time_text": {"type": ["string", "null"]},
+                                    "transaction_time_iso": {"type": ["string", "null"]},
+                                    "payer": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "name": {"type": ["string", "null"]},
+                                            "organization_number": {"type": ["string", "null"]},
+                                        },
+                                        "required": ["name", "organization_number"],
+                                    },
+                                    "payee": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "name": {"type": ["string", "null"]},
+                                            "organization_number": {"type": ["string", "null"]},
+                                        },
+                                        "required": ["name", "organization_number"],
+                                    },
+                                },
+                                "required": [
+                                    "amount_text", "amount_decimal", "currency",
+                                    "reference_numbers", "account_numbers",
+                                    "transaction_time_text", "transaction_time_iso",
+                                    "payer", "payee"
+                                ],
+                            },
+                            "classification": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "document_type": {
+                                        "type": ["string", "null"],
+                                        "enum": [
+                                            "income_voucher", "expense_voucher",
+                                            "payroll_voucher", "loan_interest_voucher",
+                                            "tax_voucher", None
+                                        ],
+                                    },
+                                    "is_certain": {"type": "boolean"},
+                                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                    "reason": {"type": "string"},
+                                    "evidence": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": [
+                                    "document_type", "is_certain", "confidence", "reason", "evidence"
+                                ],
+                            },
                         },
-                        "required": ["status", "reasons", "text", "payment_candidates"],
+                        "required": [
+                            "status", "reasons", "text", "payment_candidates",
+                            "financial_facts", "classification"
+                        ],
                     },
                 },
             },
@@ -297,6 +386,12 @@ class OpenAIVisionClient:
         if status not in {"accepted", "needs_manual_confirmation", "needs_reupload"}:
             status = "needs_manual_confirmation"
         response_model = str(response_payload.get("model") or model)
+        financial_facts = result.get("financial_facts")
+        if not isinstance(financial_facts, dict):
+            financial_facts = {}
+        classification = result.get("classification")
+        if not isinstance(classification, dict):
+            classification = {}
         return {
             "request_id": str(response_payload.get("id") or "openai-vision"),
             "status": status,
@@ -315,6 +410,8 @@ class OpenAIVisionClient:
                     "payment_candidates": payment_candidates,
                 }
             ],
+            "financial_facts": financial_facts,
+            "classification": classification,
             "processing_ms": round((time.perf_counter() - started) * 1000, 2),
             "usage": response_payload.get("usage") or {},
         }

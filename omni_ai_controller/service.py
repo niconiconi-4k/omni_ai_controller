@@ -176,6 +176,7 @@ class VisionAnalyzeRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content_type: Literal["image/jpeg", "image/png", "image/webp"]
     image_base64: str = Field(min_length=1, max_length=28_000_000)
+    model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] | None = None
 
 
 class SupportMessage(BaseModel):
@@ -534,6 +535,7 @@ def create_app(
                 image,
                 filename=payload.filename,
                 content_type=payload.content_type,
+                model_override=payload.model,
             )
         except VisionRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

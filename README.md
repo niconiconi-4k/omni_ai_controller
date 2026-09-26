@@ -134,14 +134,14 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 | [`gpt-4.1`](https://developers.openai.com/api/docs/models/gpt-4.1) | 非推理模型，约 1M token 上下文，擅长指令遵循 | 支持 | **可选视觉模型** |
 | [`gpt-4o`](https://developers.openai.com/api/docs/models/gpt-4o) | 成熟的多模态模型，128K token 上下文 | 支持 | **默认视觉模型** |
 
-系统目前只在凭证识图中开放 `gpt-4o`、`gpt-4.1` 和 `gpt-6-sol`，默认 `vision_model = "gpt-4o"`。这是刻意设置的服务端白名单：避免管理员输入任意模型名或外部 API 地址，并确保返回值能够转换为现有 OCR/金额提取结构。GPT-6 Sol 通过 Chat Completions 使用 `reasoning_effort = "none"` 和 `max_completion_tokens`，减少固定提取任务的推理开销并避开旧参数。模型目录会随 OpenAI 调整，升级白名单前应重新核对模型可用性、价格和弃用公告。
+系统目前只在凭证识图中开放 `gpt-4o`、`gpt-4.1` 和 `gpt-6-sol`，默认 `vision_model = "gpt-4o"`。这是刻意设置的服务端白名单：避免管理员输入任意模型名或外部 API 地址。公司 `0` 的未分类凭证流程会在受保护的内部请求中逐次覆盖为 `gpt-6-sol`，不修改全局选择；严格 JSON 契约同时返回 OCR 原文、金额/币种、参考号、保留星号的账户或卡号、交易时间、付款方/收款方及五类凭证粗分类。GPT-6 Sol 通过 Chat Completions 使用 `reasoning_effort = "none"` 和 `max_completion_tokens`。模型目录会随 OpenAI 调整，升级白名单前应重新核对模型可用性、价格和弃用公告。
 
 配置和调用流程：
 
 1. 管理员进入 `/dashboard/`，在“模型运行时”点击 GPT-4o 图标。
 2. 选择 `gpt-4o`、`gpt-4.1` 或 `gpt-6-sol`，在密码输入框中填写自己的 OpenAI API 密钥。
 3. Controller 将密钥原子写入 `/etc/omni-ai-controller/openai-vision.json`，文件权限固定为 `0600`；GET 接口只返回 `configured` 状态，绝不返回密钥或密钥片段。
-4. 凭证实验室可逐次选择“PP-OCRv6 · 本地”或“OpenAI · 云端识图”。主服务通过 Unix Socket 和独立内部令牌调用 Controller，只有 Controller 能读取 OpenAI 密钥并访问固定的 `https://api.openai.com/v1/chat/completions`。
+4. 已分类凭证可逐次选择“PP-OCRv6 · 本地”或 OpenAI；未分类凭证固定使用 GPT-6 Sol 完成字段读取与粗分类。主服务通过 Unix Socket 和独立内部令牌调用 Controller，只有 Controller 能读取 OpenAI 密钥并访问固定的 `https://api.openai.com/v1/chat/completions`。
 5. 图片选择 OpenAI 引擎时会发送给 OpenAI API；选择 PP-OCRv6 时图片保持在本机 Docker 网络内。单张 OpenAI 识图图片限制为 20 MiB。
 
 相关管理接口：
