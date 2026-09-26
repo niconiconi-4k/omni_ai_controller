@@ -286,11 +286,12 @@ class OpenAIVisionClient:
         status = str(result.get("status") or "needs_manual_confirmation")
         if status not in {"accepted", "needs_manual_confirmation", "needs_reupload"}:
             status = "needs_manual_confirmation"
+        response_model = str(response_payload.get("model") or model)
         return {
             "request_id": str(response_payload.get("id") or "openai-vision"),
             "status": status,
             "reasons": [str(value) for value in (result.get("reasons") or [])],
-            "model": {"provider": "openai", "vision": model},
+            "model": {"provider": "openai", "vision": response_model},
             "image": {
                 "filename": filename,
                 "content_type": content_type,

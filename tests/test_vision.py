@@ -60,6 +60,7 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
     store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
     response = {
         "id": "request-1",
+        "model": "gpt-4o-2024-11-20",
         "choices": [
             {
                 "message": {
@@ -82,7 +83,12 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
                 }
             }
         ],
-        "usage": {"total_tokens": 100},
+        "usage": {
+            "prompt_tokens": 80,
+            "completion_tokens": 20,
+            "total_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 10},
+        },
     }
 
     with patch("omni_ai_controller.vision.urlopen", return_value=FakeResponse(response)) as request:
@@ -93,7 +99,10 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
         )
 
     assert result["request_id"] == "request-1"
-    assert result["model"] == {"provider": "openai", "vision": "gpt-4o"}
+    assert result["model"] == {"provider": "openai", "vision": "gpt-4o-2024-11-20"}
+    assert result["usage"]["prompt_tokens"] == 80
+    assert result["usage"]["completion_tokens"] == 20
+    assert result["usage"]["prompt_tokens_details"]["cached_tokens"] == 10
     assert result["receipts"][0]["payment_candidates"][0]["amounts"] == ["123,45"]
     sent_request = request.call_args.args[0]
     assert sent_request.full_url == "https://api.openai.com/v1/chat/completions"
