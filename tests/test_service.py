@@ -1,4 +1,5 @@
 import ipaddress
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,6 +64,7 @@ class FakeController:
             refresh=lambda: None,
             client=SimpleNamespace(
                 chat=self.chat,
+                chat_json=self.chat_json,
                 config=SimpleNamespace(model_name="test-qwen"),
             ),
         )
@@ -70,6 +72,20 @@ class FakeController:
     def chat(self, messages, enable_thinking):  # type: ignore[no-untyped-def]
         self.chat_messages = messages
         return SimpleNamespace(content="你好", reasoning_content="")
+
+    def chat_json(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        self.chat_messages = messages
+        return SimpleNamespace(
+            content=json.dumps({
+                "document_type": "expense_voucher",
+                "is_certain": True,
+                "confidence": 0.94,
+                "reason": "供应商发票",
+                "evidence": ["Invoice"],
+            }),
+            reasoning_content="",
+            raw={"id": "qwen-request-1", "usage": {"total_tokens": 88}},
+        )
 
     def overview(self) -> dict[str, object]:
         return {"hardware": {}, "containers": [], "model": {}}
@@ -229,6 +245,7 @@ class FakeVisionClient:
         filename: str,
         content_type: str,
         model_override: str | None = None,
+        classify: bool = True,
     ) -> dict[str, object]:
         return {
             "request_id": "vision-1",
@@ -387,6 +404,24 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert analyzed.status_code == 200
         assert analyzed.json()["request_id"] == "vision-1"
         assert analyzed.json()["model"]["vision"] == "gpt-6-sol"
+
+        rejected_classification = test_client.post(
+            "/internal/quantization/classify",
+            json={"text": "Invoice", "financial_facts": {}},
+        )
+        assert rejected_classification.status_code == 401
+        classified = test_client.post(
+            "/internal/quantization/classify",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "text": "Invoice 88,00 SEK",
+                "financial_facts": {"amount_decimal": "88.00", "currency": "SEK"},
+            },
+        )
+        assert classified.status_code == 200, classified.text
+        assert classified.json()["status"] == "accepted"
+        assert classified.json()["model"]["classifier"] == "test-qwen"
+        assert classified.json()["classification"]["document_type"] == "expense_voucher"
 
 
 def test_internal_support_chat_uses_fixed_system_prompt() -> None:

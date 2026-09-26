@@ -166,6 +166,7 @@ class OpenAIVisionClient:
         filename: str,
         content_type: str,
         model_override: str | None = None,
+        classify: bool = True,
     ) -> dict[str, Any]:
         if content_type not in {"image/jpeg", "image/png", "image/webp"}:
             raise VisionRequestError("OpenAI 识图仅支持 JPEG、PNG 和 WebP", status_code=415)
@@ -176,6 +177,21 @@ class OpenAIVisionClient:
         if model not in SUPPORTED_VISION_MODELS:
             raise VisionRequestError("不支持该 OpenAI 识图模型", status_code=422)
         encoded = base64.b64encode(image).decode("ascii")
+        classification_instruction = (
+            "Classify only when the visual evidence is strong: income_voucher = sales invoice, "
+            "POS/Z report, or credit invoice/Kreditfaktura; expense_voucher = supplier invoice, "
+            "purchase receipt, or travel reimbursement; payroll_voucher = payslip or employer "
+            "declaration; loan_interest_voucher = bank loan, repayment, interest, or bank-fee "
+            "document; tax_voucher = VAT return, tax, customs, import, or export document. Never "
+            "return bank_voucher or uncategorized. Set classification.is_certain=true only when "
+            "one category is unambiguous and confidence is at least 0.85; otherwise return "
+            "document_type=null and status=needs_manual_confirmation."
+            if classify
+            else "Do not classify this document. Set classification.document_type=null, "
+            "classification.is_certain=false, classification.confidence=0, explain that local "
+            "classification was requested in classification.reason, and use an empty evidence "
+            "array. Determine status only from whether the image can be read reliably."
+        )
         payload = {
             "model": model,
             "messages": [
@@ -190,15 +206,9 @@ class OpenAIVisionClient:
                                 "must retain every visible '*' and digit exactly. Extract the final paid or "
                                 "payable amount, ISO currency when visible, reference/OCR/payment identifiers, "
                                 "account or card numbers, transaction time, and payer/payee company names and "
-                                "organization/tax numbers. Classify only when the visual evidence is strong: "
-                                "income_voucher = sales invoice, POS/Z report, or credit invoice/Kreditfaktura; "
-                                "expense_voucher = supplier invoice, purchase receipt, or travel reimbursement; "
-                                "payroll_voucher = payslip or employer declaration; loan_interest_voucher = bank "
-                                "loan, repayment, interest, or bank-fee document; tax_voucher = VAT return, tax, "
-                                "customs, import, or export document. Never return bank_voucher or uncategorized. "
-                                "Set classification.is_certain=true only when one category is unambiguous and "
-                                "confidence is at least 0.85; otherwise return document_type=null and "
-                                "status=needs_manual_confirmation. Use needs_reupload only when image quality "
+                                "organization/tax numbers. "
+                                + classification_instruction
+                                + " Use needs_reupload only when image quality "
                                 "prevents reliable reading. Return only data matching the supplied JSON schema."
                             ),
                         },

@@ -90,6 +90,46 @@ class ModelServerClient:
         reasoning = message.get("reasoning_content") or ""
         return ChatResult(str(content), str(reasoning), data)
 
+    def chat_json(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        schema_name: str,
+        schema: dict[str, Any],
+        max_tokens: int = 768,
+    ) -> ChatResult:
+        self.config.require_credentials()
+        payload = {
+            "model": self.config.model_name,
+            "messages": messages,
+            "stream": False,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        }
+        data = self._request(
+            "POST",
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            payload=payload,
+            timeout=3600,
+        )
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ServerRequestError("模型响应缺少 choices[0].message") from exc
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        return ChatResult(str(content), str(reasoning), data)
+
     def _request(
         self,
         method: str,

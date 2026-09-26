@@ -134,14 +134,14 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 | [`gpt-4.1`](https://developers.openai.com/api/docs/models/gpt-4.1) | 非推理模型，约 1M token 上下文，擅长指令遵循 | 支持 | **可选视觉模型** |
 | [`gpt-4o`](https://developers.openai.com/api/docs/models/gpt-4o) | 成熟的多模态模型，128K token 上下文 | 支持 | **默认视觉模型** |
 
-系统目前只在凭证识图中开放 `gpt-4o`、`gpt-4.1` 和 `gpt-6-sol`，默认 `vision_model = "gpt-4o"`。这是刻意设置的服务端白名单：避免管理员输入任意模型名或外部 API 地址。公司 `0` 的未分类凭证流程会在受保护的内部请求中逐次覆盖为 `gpt-6-sol`，不修改全局选择；严格 JSON 契约同时返回 OCR 原文、金额/币种、参考号、保留星号的账户或卡号、交易时间、付款方/收款方及五类凭证粗分类。GPT-6 Sol 通过 Chat Completions 使用 `reasoning_effort = "none"` 和 `max_completion_tokens`。模型目录会随 OpenAI 调整，升级白名单前应重新核对模型可用性、价格和弃用公告。
+系统目前只在凭证识图中开放 `gpt-4o`、`gpt-4.1` 和 `gpt-6-sol`，默认 `vision_model = "gpt-4o"`。这是刻意设置的服务端白名单：避免管理员输入任意模型名或外部 API 地址。公司 `0` 的未分类凭证流程会在受保护的内部请求中逐次覆盖为 `gpt-6-sol`，不修改全局选择；严格 JSON 契约返回 OCR 原文、金额/币种、参考号、保留星号的账户或卡号、交易时间及付款方/收款方。管理员可选择由 GPT 同时完成五类粗分类，或要求 GPT 跳过分类并由本地 `qwen3.6-27b-instruct` 依据提取结果分类。GPT-6 Sol 通过 Chat Completions 使用 `reasoning_effort = "none"` 和 `max_completion_tokens`。模型目录会随 OpenAI 调整，升级白名单前应重新核对模型可用性、价格和弃用公告。
 
 配置和调用流程：
 
 1. 管理员进入 `/dashboard/`，在“模型运行时”点击 GPT-4o 图标。
 2. 选择 `gpt-4o`、`gpt-4.1` 或 `gpt-6-sol`，在密码输入框中填写自己的 OpenAI API 密钥。
 3. Controller 将密钥原子写入 `/etc/omni-ai-controller/openai-vision.json`，文件权限固定为 `0600`；GET 接口只返回 `configured` 状态，绝不返回密钥或密钥片段。
-4. 已分类凭证可逐次选择“PP-OCRv6 · 本地”或 OpenAI；未分类凭证固定使用 GPT-6 Sol 完成字段读取与粗分类。主服务通过 Unix Socket 和独立内部令牌调用 Controller，只有 Controller 能读取 OpenAI 密钥并访问固定的 `https://api.openai.com/v1/chat/completions`。
+4. 已分类凭证可逐次选择“PP-OCRv6 · 本地”或 OpenAI；未分类凭证固定由 GPT-6 Sol 读取，并可选择“纯 GPT”或“GPT 识图 + Qwen 本地分类”。主服务通过 Unix Socket 和独立内部令牌调用 Controller，只有 Controller 能读取 OpenAI 密钥并访问固定的 `https://api.openai.com/v1/chat/completions`。
 5. 图片选择 OpenAI 引擎时会发送给 OpenAI API；选择 PP-OCRv6 时图片保持在本机 Docker 网络内。单张 OpenAI 识图图片限制为 20 MiB。
 
 相关管理接口：
@@ -150,6 +150,7 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 - `PUT /vision/settings`：保存模型及可选的新密钥；浏览器请求必须通过管理员会话与 CSRF 校验。
 - `DELETE /vision/settings/key`：删除已保存的 OpenAI 密钥并立即停用云端识图。
 - `POST /internal/vision/receipts`：仅供主服务通过 Unix Socket 和 `VISION_INTERNAL_TOKEN` 调用，不对浏览器开放。
+- `POST /internal/quantization/classify`：使用固定提示词和严格 JSON Schema 调用本地 Qwen，只接受 OCR 文本与结构化字段；同样要求内部令牌，不对浏览器开放。
 
 密钥不会写入 PostgreSQL、浏览器存储、容器镜像、Git、响应内容或正常日志。移除密钥后，本地 Qwen 和 PP-OCRv6 仍可照常运行。保存配置不会验证或消费密钥；只有管理员主动选择 OpenAI 引擎处理凭证时才会产生 OpenAI API 请求和费用。
 

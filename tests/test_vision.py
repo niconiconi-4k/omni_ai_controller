@@ -172,6 +172,7 @@ def test_gpt_6_sol_uses_compatible_chat_completion_parameters(tmp_path: Path) ->
             filename="receipt.png",
             content_type="image/png",
             model_override="gpt-6-sol",
+            classify=False,
         )
 
     sent_payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
@@ -179,4 +180,5 @@ def test_gpt_6_sol_uses_compatible_chat_completion_parameters(tmp_path: Path) ->
     assert sent_payload["reasoning_effort"] == "none"
     assert sent_payload["max_completion_tokens"] == 4096
     assert "max_tokens" not in sent_payload
+    assert "Do not classify this document" in sent_payload["messages"][0]["content"][0]["text"]
     assert result["model"]["vision"] == "gpt-6-sol"

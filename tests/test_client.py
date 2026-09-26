@@ -55,3 +55,22 @@ def test_chat_rejects_invalid_response() -> None:
             ModelServerClient(config()).chat(
                 [{"role": "user", "content": "你好"}], enable_thinking=False
             )
+
+
+def test_chat_json_sends_strict_schema() -> None:
+    response = {"id": "local-1", "choices": [{"message": {"content": "{}"}}]}
+    with patch(
+        "omni_ai_controller.client.urlopen", return_value=FakeResponse(response)
+    ) as request:
+        result = ModelServerClient(config()).chat_json(
+            [{"role": "user", "content": "分类"}],
+            schema_name="test_schema",
+            schema={"type": "object", "properties": {}},
+        )
+
+    payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
+    assert payload["temperature"] == 0
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["response_format"]["json_schema"]["strict"] is True
+    assert payload["response_format"]["json_schema"]["name"] == "test_schema"
+    assert result.raw["id"] == "local-1"

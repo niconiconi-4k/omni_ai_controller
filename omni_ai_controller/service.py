@@ -39,6 +39,7 @@ from .vision import (
     VisionSettingsError,
     VisionSettingsStore,
 )
+from .voucher_classifier import VoucherClassificationError, classify_voucher
 
 LOGGER = logging.getLogger("omni_ai_controller.service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -177,6 +178,12 @@ class VisionAnalyzeRequest(BaseModel):
     content_type: Literal["image/jpeg", "image/png", "image/webp"]
     image_base64: str = Field(min_length=1, max_length=28_000_000)
     model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] | None = None
+    classify: bool = True
+
+
+class VoucherClassificationRequest(BaseModel):
+    text: str = Field(default="", max_length=100_000)
+    financial_facts: dict[str, object] = Field(default_factory=dict)
 
 
 class SupportMessage(BaseModel):
@@ -273,6 +280,7 @@ def create_app(
         if request.url.path in {
             "/health/live",
             "/internal/vision/receipts",
+            "/internal/quantization/classify",
             "/internal/support/chat",
             "/internal/admin/authorize",
             "/internal/admin/confirm-password",
@@ -536,9 +544,38 @@ def create_app(
                 filename=payload.filename,
                 content_type=payload.content_type,
                 model_override=payload.model,
+                classify=payload.classify,
             )
         except VisionRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    @application.post("/internal/quantization/classify", dependencies=[vision_internal])
+    def classify_quantization_voucher(
+        payload: VoucherClassificationRequest,
+    ) -> dict[str, object]:
+        active_controller.model_server.refresh()
+        try:
+            result = classify_voucher(
+                active_controller.model_server.client,
+                text=payload.text,
+                financial_facts=payload.financial_facts,
+            )
+        except VoucherClassificationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+        return {
+            "status": (
+                "accepted"
+                if result["classification"]["is_certain"]
+                else "needs_manual_confirmation"
+            ),
+            "request_id": result["request_id"],
+            "model": {"provider": "local", "classifier": result["model"]},
+            "classification": result["classification"],
+            "usage": result["usage"],
+        }
 
     @application.post("/internal/support/chat", dependencies=[vision_internal])
     def support_chat(payload: SupportChatRequest) -> dict[str, str]:
