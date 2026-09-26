@@ -55,6 +55,18 @@ def test_settings_store_can_change_model_without_reentering_key(tmp_path: Path) 
     assert key.startswith("sk-test-")
 
 
+def test_settings_store_supports_gpt_6_sol(tmp_path: Path) -> None:
+    store = VisionSettingsStore(tmp_path / "vision.json")
+    store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
+
+    status = store.save(model="gpt-6-sol")
+
+    assert status["model"] == "gpt-6-sol"
+    assert any(model["id"] == "gpt-6-sol" for model in status["models"])
+    model, _ = store.credentials()
+    assert model == "gpt-6-sol"
+
+
 def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
     store = VisionSettingsStore(tmp_path / "vision.json")
     store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
@@ -114,3 +126,29 @@ def test_openai_vision_requires_configuration(tmp_path: Path) -> None:
 
     with pytest.raises(VisionRequestError, match="尚未配置"):
         client.recognize(b"image", filename="receipt.png", content_type="image/png")
+
+
+def test_gpt_6_sol_uses_compatible_chat_completion_parameters(tmp_path: Path) -> None:
+    store = VisionSettingsStore(tmp_path / "vision.json")
+    store.save(model="gpt-6-sol", api_key="sk-test-012345678901234567890")
+    response = {
+        "id": "request-sol-1",
+        "model": "gpt-6-sol",
+        "choices": [{"message": {"content": json.dumps({
+            "status": "accepted", "reasons": [], "text": "TOTAL 10.00 SEK",
+            "payment_candidates": [],
+        })}}],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
+    }
+
+    with patch("omni_ai_controller.vision.urlopen", return_value=FakeResponse(response)) as request:
+        result = OpenAIVisionClient(store).recognize(
+            b"image-bytes", filename="receipt.png", content_type="image/png"
+        )
+
+    sent_payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
+    assert sent_payload["model"] == "gpt-6-sol"
+    assert sent_payload["reasoning_effort"] == "none"
+    assert sent_payload["max_completion_tokens"] == 4096
+    assert "max_tokens" not in sent_payload
+    assert result["model"]["vision"] == "gpt-6-sol"

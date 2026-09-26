@@ -168,7 +168,7 @@ class ConversationChatRequest(BaseModel):
 
 
 class VisionSettingsUpdate(BaseModel):
-    model: Literal["gpt-4o", "gpt-4.1"] = "gpt-4o"
+    model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] = "gpt-4o"
     api_key: SecretStr | None = Field(default=None)
 
 

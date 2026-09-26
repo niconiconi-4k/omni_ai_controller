@@ -22,6 +22,11 @@ SUPPORTED_VISION_MODELS: dict[str, dict[str, object]] = {
         "description": "指令遵循更强，约 1M 上下文",
         "default": False,
     },
+    "gpt-6-sol": {
+        "label": "GPT-6 Sol",
+        "description": "适合复杂凭证与银行流水识别，约 1M 上下文",
+        "default": False,
+    },
 }
 DEFAULT_VISION_MODEL = "gpt-4o"
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
@@ -220,9 +225,14 @@ class OpenAIVisionClient:
                     },
                 },
             },
-            "temperature": 0,
-            "max_tokens": 4096,
         }
+        if model == "gpt-6-sol":
+            payload["reasoning_effort"] = "none"
+            payload["temperature"] = 0
+            payload["max_completion_tokens"] = 4096
+        else:
+            payload["temperature"] = 0
+            payload["max_tokens"] = 4096
         request = Request(
             OPENAI_CHAT_COMPLETIONS_URL,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

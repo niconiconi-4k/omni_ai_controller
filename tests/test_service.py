@@ -348,6 +348,14 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert updated.json()["configured"] is True
         assert "api_key" not in updated.json()
 
+        switched = test_client.put(
+            "/vision/settings",
+            headers=headers(),
+            json={"model": "gpt-6-sol"},
+        )
+        assert switched.status_code == 200
+        assert switched.json()["model"] == "gpt-6-sol"
+
         import base64
 
         rejected = test_client.post(
