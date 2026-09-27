@@ -37,17 +37,34 @@ def test_read_env_supports_comments_export_and_quotes(tmp_path: Path) -> None:
 def test_server_config_reads_model_environment(tmp_path: Path) -> None:
     model_dir = make_model_dir(tmp_path)
     (model_dir / ".env").write_text(
-        "API_PORT=9000\nOPENAI_API_KEY=openai\nCONTROL_TOKEN=control\n"
-        "SERVED_MODEL_NAME=test-model\n",
+        "API_PORT=9000\nSERVED_MODEL_NAME=test-model\n",
+        encoding="utf-8",
+    )
+    secrets_file = tmp_path / "model-secrets.env"
+    secrets_file.write_text(
+        "OPENAI_API_KEY=openai\nCONTROL_TOKEN=control\n",
         encoding="utf-8",
     )
 
-    config = ServerConfig.from_model_dir(model_dir)
+    config = ServerConfig.from_model_dir(model_dir, secrets_file)
 
     assert config.base_url == "http://127.0.0.1:9000"
     assert config.api_key == "openai"
     assert config.control_token == "control"
     assert config.model_name == "test-model"
+
+
+def test_server_config_never_reads_credentials_from_runtime_env(tmp_path: Path) -> None:
+    model_dir = make_model_dir(tmp_path)
+    (model_dir / ".env").write_text(
+        "OPENAI_API_KEY=legacy-openai\nCONTROL_TOKEN=legacy-control\n",
+        encoding="utf-8",
+    )
+
+    config = ServerConfig.from_model_dir(model_dir, tmp_path / "missing-secrets.env")
+
+    assert config.api_key == ""
+    assert config.control_token == ""
 
 
 def test_validate_model_dir_reports_missing_files(tmp_path: Path) -> None:
