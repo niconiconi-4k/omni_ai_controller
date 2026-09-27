@@ -77,6 +77,25 @@ class FakeController:
 
     def chat_json(self, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.chat_messages = messages
+        if kwargs.get("schema_name") == "local_audit_reconciliation":
+            return SimpleNamespace(
+                content=json.dumps({
+                    "decisions": [{
+                        "transaction_id": "tx-1",
+                        "receipt_upload_ids": ["receipt-1", "receipt-2"],
+                        "kind": "employee_reimbursement",
+                        "recommendation": "suggest",
+                        "confidence": 0.81,
+                        "explanation": "两张垫付小票日期早于企业转账",
+                        "evidence": ["候选合计金额接近"],
+                        "discrepancy_note": "差额需写入审计报告",
+                    }],
+                    "summary": "发现一组可能的员工垫付报销",
+                    "risks": ["缺少手写报销标记"],
+                }),
+                reasoning_content="",
+                raw={"id": "audit-request-1", "usage": {"total_tokens": 320}},
+            )
         return SimpleNamespace(
             content=json.dumps({
                 "document_type": "expense_voucher",
@@ -504,6 +523,27 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert classified.json()["status"] == "accepted"
         assert classified.json()["model"]["classifier"] == "test-qwen"
         assert classified.json()["classification"]["document_type"] == "expense_voucher"
+
+        rejected_audit = test_client.post(
+            "/internal/audit/reconcile",
+            json={"audit_id": "audit-1", "context": {}},
+        )
+        assert rejected_audit.status_code == 401
+        audited = test_client.post(
+            "/internal/audit/reconcile",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "audit_id": "audit-1",
+                "context": {
+                    "transactions": [{"id": "tx-1"}],
+                    "receipts": [{"id": "receipt-1"}, {"id": "receipt-2"}],
+                    "deterministic_candidates": [],
+                },
+            },
+        )
+        assert audited.status_code == 200, audited.text
+        assert audited.json()["serialized"] is True
+        assert audited.json()["result"]["decisions"][0]["kind"] == "employee_reimbursement"
 
 
 def test_internal_vision_rejects_document_total_before_forwarding(monkeypatch) -> None:

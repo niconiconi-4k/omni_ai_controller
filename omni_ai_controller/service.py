@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, SecretStr
 
 from .admin import AdminCommandError, AdminController
+from .audit_skill import AuditSkillError, analyze_audit
 from .bank_statement import (
     MAX_STATEMENT_PAGES,
     MAX_STATEMENT_TEXT_CHARS,
@@ -222,6 +223,11 @@ class VoucherClassificationRequest(BaseModel):
     financial_facts: dict[str, object] = Field(default_factory=dict)
 
 
+class AuditReconciliationRequest(BaseModel):
+    audit_id: str = Field(min_length=1, max_length=64)
+    context: dict[str, object] = Field(default_factory=dict)
+
+
 class SupportMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=4000)
@@ -320,6 +326,7 @@ def create_app(
             "/internal/vision/receipts",
             "/internal/vision/bank-statements",
             "/internal/quantization/classify",
+            "/internal/audit/reconcile",
             "/internal/support/chat",
             "/internal/admin/authorize",
             "/internal/admin/confirm-password",
@@ -807,6 +814,23 @@ def create_app(
             "classification": result["classification"],
             "usage": result["usage"],
         }
+
+    @application.post("/internal/audit/reconcile", dependencies=[vision_internal])
+    def reconcile_audit_with_local_model(
+        payload: AuditReconciliationRequest,
+    ) -> dict[str, object]:
+        active_controller.model_server.refresh()
+        try:
+            return analyze_audit(
+                active_controller.model_server.client,
+                audit_id=payload.audit_id,
+                context=payload.context,
+            )
+        except AuditSkillError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
 
     @application.post("/internal/support/chat", dependencies=[vision_internal])
     def support_chat(payload: SupportChatRequest) -> dict[str, str]:
