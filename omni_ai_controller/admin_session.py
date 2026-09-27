@@ -57,6 +57,53 @@ def validate_admin_session(secret: str, token: str) -> dict[str, str | int] | No
         return None
 
 
+def issue_trusted_browser(secret: str, ttl_days: int, account_id: str, version: int) -> str:
+    payload = {
+        "purpose": "trusted-browser",
+        "expires_at": int(time.time()) + ttl_days * 86400,
+        "account_id": account_id,
+        "version": version,
+        "nonce": secrets.token_urlsafe(16),
+    }
+    body = _encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signature = _encode(
+        hmac.new(
+            f"trusted-browser:{secret}".encode("utf-8"),
+            body.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+    )
+    return f"{body}.{signature}"
+
+
+def validate_trusted_browser(secret: str, token: str) -> dict[str, str | int] | None:
+    if not secret or not token:
+        return None
+    try:
+        body, supplied_signature = token.split(".", 1)
+        expected_signature = _encode(
+            hmac.new(
+                f"trusted-browser:{secret}".encode("utf-8"),
+                body.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        )
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            return None
+        payload = json.loads(_decode(body))
+        if payload.get("purpose") != "trusted-browser":
+            return None
+        if int(payload["expires_at"]) <= int(time.time()):
+            return None
+        account_id = str(payload["account_id"])
+        version = int(payload["version"])
+        if not account_id or version < 1:
+            return None
+        return {"account_id": account_id, "version": version}
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
 def validate_admin_csrf(
     expected_hash: str, cookie_token: str, header_token: str
 ) -> bool:

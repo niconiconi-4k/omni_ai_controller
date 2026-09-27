@@ -38,6 +38,7 @@ if [[ ! -f "${config_file}" ]]; then
 OMNI_MODEL_DIR=${model_dir}
 OMNI_ADMIN_TOKEN=${token}
 OMNI_ADMIN_SESSION_TTL_HOURS=12
+OMNI_ADMIN_TRUSTED_BROWSER_TTL_DAYS=30
 OMNI_ALLOWED_NETWORKS=192.168.192.0/24
 OMNI_ALLOWED_CONTAINERS=omni-ai-model,omni-ai-receipt-ocr,omni-ai-main-service,omni-ai-database
 OMNI_CONTROLLER_SOCKET=/run/omni-ai-controller/controller.sock
@@ -52,6 +53,9 @@ if grep -q '^OMNI_ALLOWED_CONTAINERS=' "${config_file}" && \
 fi
 if ! grep -q '^OMNI_ADMIN_SESSION_TTL_HOURS=' "${config_file}"; then
   printf '\nOMNI_ADMIN_SESSION_TTL_HOURS=12\n' >>"${config_file}"
+fi
+if ! grep -q '^OMNI_ADMIN_TRUSTED_BROWSER_TTL_DAYS=' "${config_file}"; then
+  printf 'OMNI_ADMIN_TRUSTED_BROWSER_TTL_DAYS=30\n' >>"${config_file}"
 fi
 if ! grep -q '^OMNI_CONVERSATION_DATABASE_HOST=' "${config_file}"; then
   printf 'OMNI_CONVERSATION_DATABASE_HOST=127.0.0.1\n' >>"${config_file}"

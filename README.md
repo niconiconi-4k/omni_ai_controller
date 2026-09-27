@@ -99,7 +99,7 @@ chmod +x scripts/install-service.sh
 bash scripts/install-service.sh
 ```
 
-服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。其中的 `OMNI_ADMIN_TOKEN` 只用于服务端 HMAC 签名，不可直接登录。管理员必须使用独立的用户名、密码和个人 token 登录 `/admin-login/`；密码以 Argon2id 散列保存，个人 token 只存 HMAC 散列，首次创建或重置时仅显示一次。会话绑定账号和授权版本，删除、重置或调整权限后旧会话立即失效。固定超级管理员 Mutsu 的信息由数据库触发器保护，不在账户列表显示，并自动拥有现有及将来的全部权限。
+服务配置保存在 `/etc/omni-ai-controller/service.env`，权限为 `0600`。其中的 `OMNI_ADMIN_TOKEN` 只用于服务端 HMAC 签名，不可直接登录。管理员必须使用独立的用户名、密码和个人 token 登录 `/admin-login/`；密码以 Argon2id 散列保存，个人 token 只存 HMAC 散列，首次创建或重置时仅显示一次。管理员可让浏览器安全记住 token：服务端不会保存或回传原 token，而是签发最长 30 天、HttpOnly、Secure、SameSite=Strict 且绑定账号授权版本的受信浏览器 Cookie；修改密码、轮换 token、调整权限或删除账号后自动失效。期限可由 `OMNI_ADMIN_TRUSTED_BROWSER_TTL_DAYS` 在 1–365 天之间配置。会话同样绑定账号和授权版本。固定超级管理员 Mutsu 的信息由数据库触发器保护，不在账户列表显示，并自动拥有现有及将来的全部权限。
 
 部署前先在数据库项目运行第 012 号迁移，再安装控制器，并由有 sudo 权限的维护者执行 `sudo /opt/omni-ai-controller/venv/bin/python scripts/bootstrap-admin.py`。脚本仅通过交互式终端读取初始密码，不将其写入脚本、命令行或数据库明文；生成的个人 token 仅在终端显示一次。此账号一经创建，不支持修改密码、轮换 token 或删除，因此务必妥善保管个人 token。
 
