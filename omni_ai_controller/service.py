@@ -21,6 +21,11 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, SecretStr
 
 from .admin import AdminCommandError, AdminController
+from .bank_statement import (
+    MAX_STATEMENT_PAGES,
+    MAX_STATEMENT_TEXT_CHARS,
+    OpenAIBankStatementClient,
+)
 from .admin_account_store import (
     PERMISSIONS, AdminAccountConflict, AdminAccountError, AdminAccountStore,
 )
@@ -198,6 +203,20 @@ class VisionAnalyzeRequest(BaseModel):
     classify: bool = True
 
 
+class StatementPageRequest(BaseModel):
+    page_number: int = Field(ge=1, le=MAX_STATEMENT_PAGES)
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: Literal["image/jpeg", "image/png", "image/webp"]
+    image_base64: str = Field(min_length=1, max_length=28_000_000)
+
+
+class BankStatementAnalyzeRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    source_kind: Literal["pdf_text", "pdf_image", "pdf_hybrid", "spreadsheet", "image"]
+    pages: list[StatementPageRequest] = Field(default_factory=list, max_length=MAX_STATEMENT_PAGES)
+    document_text: str = Field(default="", max_length=MAX_STATEMENT_TEXT_CHARS)
+
+
 class VoucherClassificationRequest(BaseModel):
     text: str = Field(default="", max_length=100_000)
     financial_facts: dict[str, object] = Field(default_factory=dict)
@@ -238,6 +257,7 @@ def create_app(
     metric_store: MetricStore | None = None,
     vision_settings_store: VisionSettingsStore | None = None,
     vision_client: OpenAIVisionClient | None = None,
+    statement_client: OpenAIBankStatementClient | None = None,
     admin_account_store: AdminAccountStore | None = None,
 ) -> FastAPI:
     active_settings = settings or ServiceSettings.from_environment()
@@ -263,6 +283,7 @@ def create_app(
         active_settings.vision_config_path
     )
     active_vision_client = vision_client or OpenAIVisionClient(active_vision_store)
+    active_statement_client = statement_client or OpenAIBankStatementClient(active_vision_store)
     active_admin_accounts = admin_account_store or AdminAccountStore(
         host=active_settings.database_host,
         port=active_settings.database_port,
@@ -297,6 +318,7 @@ def create_app(
         if request.url.path in {
             "/health/live",
             "/internal/vision/receipts",
+            "/internal/vision/bank-statements",
             "/internal/quantization/classify",
             "/internal/support/chat",
             "/internal/admin/authorize",
@@ -708,6 +730,52 @@ def create_app(
                 content_type=content_type,
                 model_override=payload.model,
                 classify=payload.classify,
+            )
+        except VisionRequestError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    @application.post("/internal/vision/bank-statements", dependencies=[vision_internal])
+    def analyze_bank_statement(
+        payload: BankStatementAnalyzeRequest,
+    ) -> dict[str, object]:
+        decoded_pages: list[tuple[bytes, str, str, int]] = []
+        seen_page_numbers: set[int] = set()
+        total_decoded_bytes = 0
+        for page in payload.pages:
+            if page.page_number in seen_page_numbers:
+                raise HTTPException(status_code=422, detail="Statement page numbers must be unique")
+            seen_page_numbers.add(page.page_number)
+            try:
+                image = base64.b64decode(page.image_base64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid base64 image for statement page {page.page_number}",
+                ) from exc
+            if not image or len(image) > MAX_VISION_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Statement page {page.page_number} must be between 1 byte and 20 MiB",
+                )
+            total_decoded_bytes += len(image)
+            if total_decoded_bytes > MAX_VISION_DOCUMENT_BYTES:
+                raise HTTPException(status_code=413, detail="Statement pages exceed 32 MiB in total")
+            decoded_pages.append(
+                (image, Path(page.filename).name, page.content_type, page.page_number)
+            )
+        decoded_pages.sort(key=lambda item: item[3])
+        if decoded_pages and [page[3] for page in decoded_pages] != list(
+            range(1, len(decoded_pages) + 1)
+        ):
+            raise HTTPException(status_code=422, detail="Statement pages must be continuous from 1")
+        if not decoded_pages and not payload.document_text.strip():
+            raise HTTPException(status_code=422, detail="Statement content is empty")
+        try:
+            return active_statement_client.recognize(
+                pages=decoded_pages,
+                document_text=payload.document_text,
+                source_kind=payload.source_kind,
+                filename=Path(payload.filename).name,
             )
         except VisionRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

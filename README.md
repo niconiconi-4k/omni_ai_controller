@@ -143,6 +143,7 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 3. Controller 将密钥原子写入 `/etc/omni-ai-controller/openai-vision.json`，文件权限固定为 `0600`；GET 接口只返回 `configured` 状态，绝不返回密钥或密钥片段。
 4. 已分类凭证可逐次选择“PP-OCRv6 · 本地”或 OpenAI；未分类凭证固定由 GPT-6 Sol 读取，并可选择“纯 GPT”或“GPT 识图 + Qwen 本地分类”。主服务通过 Unix Socket 和独立内部令牌调用 Controller，只有 Controller 能读取 OpenAI 密钥并访问固定的 `https://api.openai.com/v1/chat/completions`。
 5. 图片选择 OpenAI 引擎时会发送给 OpenAI API；PDF 会作为最多 12 张连续编号的渲染页以及可用的布局文字层在一次文档请求中发送。选择 PP-OCRv6 时图片和 PDF 渲染页保持在本机 Docker 网络内。每张 OpenAI 识图页面限制为 20 MiB，整个渲染文档限制为 32 MiB。
+6. 实验室银行流水固定使用 GPT-6 Sol，通过独立严格 JSON Schema 提取账户摘要和逐笔交易；PDF 最多 40 页，Excel/CSV 以带工作表、行号和列号的有序文本输入，模型必须忽略导航、广告、汇总和重复表头等干扰内容。
 
 相关管理接口：
 
@@ -150,6 +151,7 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 - `PUT /vision/settings`：保存模型及可选的新密钥；浏览器请求必须通过管理员会话与 CSRF 校验。
 - `DELETE /vision/settings/key`：删除已保存的 OpenAI 密钥并立即停用云端识图。
 - `POST /internal/vision/receipts`：仅供主服务通过 Unix Socket 和 `VISION_INTERNAL_TOKEN` 调用，不对浏览器开放。
+- `POST /internal/vision/bank-statements`：仅供实验室银行流水流程调用，接受有序渲染页或表格文本并固定使用 GPT-6 Sol。
 - `POST /internal/quantization/classify`：使用固定提示词和严格 JSON Schema 调用本地 Qwen，只接受 OCR 文本与结构化字段；同样要求内部令牌，不对浏览器开放。
 
 密钥不会写入 PostgreSQL、浏览器存储、容器镜像、Git、响应内容或正常日志。移除密钥后，本地 Qwen 和 PP-OCRv6 仍可照常运行。保存配置不会验证或消费密钥；只有管理员主动选择 OpenAI 引擎处理凭证时才会产生 OpenAI API 请求和费用。

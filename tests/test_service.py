@@ -276,7 +276,29 @@ class FakeVisionClient:
         }
 
 
-def client(controller: FakeController | None = None, store: FakeAdminAccountStore | None = None) -> TestClient:
+class FakeStatementClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def recognize(self, **arguments: object) -> dict[str, object]:
+        self.calls.append(arguments)
+        return {
+            "request_id": "statement-1",
+            "status": "accepted",
+            "model": {"provider": "openai", "vision": "gpt-6-sol"},
+            "statement": {"institution_name": "Example Bank"},
+            "transactions": [],
+            "coverage": {"transaction_count": 0, "possibly_truncated": False, "reason": ""},
+            "warnings": [],
+            "usage": {},
+        }
+
+
+def client(
+    controller: FakeController | None = None,
+    store: FakeAdminAccountStore | None = None,
+    statement_client: FakeStatementClient | None = None,
+) -> TestClient:
     settings = ServiceSettings(
         model_dir=Path("/tmp/model"),
         admin_token="secret-token",
@@ -294,6 +316,7 @@ def client(controller: FakeController | None = None, store: FakeAdminAccountStor
             FakeMetricStore(),
             FakeVisionStore(),
             FakeVisionClient(),
+            statement_client,
             admin_account_store=store or FakeAdminAccountStore(),
         ),  # type: ignore[arg-type]
         base_url="https://testserver",
@@ -509,6 +532,43 @@ def test_internal_vision_rejects_document_total_before_forwarding(monkeypatch) -
 
     assert response.status_code == 413
     assert "total" in response.json()["detail"]
+
+
+def test_internal_bank_statement_proxy_is_protected_and_preserves_source_order() -> None:
+    statement = FakeStatementClient()
+    payload = {
+        "filename": "statement.pdf",
+        "source_kind": "pdf_hybrid",
+        "document_text": "=== PDF PAGE 1/2 ===\nAccount summary",
+        "pages": [
+            {
+                "page_number": 1,
+                "filename": "page-001.jpg",
+                "content_type": "image/jpeg",
+                "image_base64": base64.b64encode(b"page-one").decode("ascii"),
+            },
+            {
+                "page_number": 2,
+                "filename": "page-002.jpg",
+                "content_type": "image/jpeg",
+                "image_base64": base64.b64encode(b"page-two").decode("ascii"),
+            },
+        ],
+    }
+    with client(statement_client=statement) as test_client:
+        rejected = test_client.post("/internal/vision/bank-statements", json=payload)
+        accepted = test_client.post(
+            "/internal/vision/bank-statements",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json=payload,
+        )
+
+    assert rejected.status_code == 401
+    assert accepted.status_code == 200
+    assert accepted.json()["request_id"] == "statement-1"
+    assert len(statement.calls) == 1
+    assert [page[3] for page in statement.calls[0]["pages"]] == [1, 2]
+    assert statement.calls[0]["source_kind"] == "pdf_hybrid"
 
 
 def test_internal_support_chat_uses_fixed_system_prompt() -> None:
