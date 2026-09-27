@@ -31,6 +31,7 @@ SUPPORTED_VISION_MODELS: dict[str, dict[str, object]] = {
 DEFAULT_VISION_MODEL = "gpt-4o"
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 MAX_VISION_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_VISION_DOCUMENT_BYTES = 32 * 1024 * 1024
 RECEIPT_DOCUMENT_TYPES = (
     "income_voucher",
     "expense_voucher",
@@ -168,15 +169,44 @@ class OpenAIVisionClient:
         model_override: str | None = None,
         classify: bool = True,
     ) -> dict[str, Any]:
-        if content_type not in {"image/jpeg", "image/png", "image/webp"}:
-            raise VisionRequestError("OpenAI 识图仅支持 JPEG、PNG 和 WebP", status_code=415)
-        if not image or len(image) > MAX_VISION_IMAGE_BYTES:
-            raise VisionRequestError("图片必须介于 1 字节和 20 MiB 之间", status_code=413)
+        return self.recognize_document(
+            [(image, filename, content_type, 1)],
+            document_text=None,
+            model_override=model_override,
+            classify=classify,
+        )
+
+    def recognize_document(
+        self,
+        pages: list[tuple[bytes, str, str, int]],
+        *,
+        document_text: str | None,
+        model_override: str | None = None,
+        classify: bool = True,
+    ) -> dict[str, Any]:
+        if not pages:
+            raise VisionRequestError("文档不包含可识别页面", status_code=400)
+        if len(pages) > 12:
+            raise VisionRequestError("文档最多支持 12 页", status_code=413)
+        total_bytes = 0
+        for image, _, content_type, page_number in pages:
+            if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+                raise VisionRequestError(
+                    f"第 {page_number} 页不是支持的 JPEG、PNG 或 WebP 图片",
+                    status_code=415,
+                )
+            if not image or len(image) > MAX_VISION_IMAGE_BYTES:
+                raise VisionRequestError(
+                    f"第 {page_number} 页图片必须介于 1 字节和 20 MiB 之间",
+                    status_code=413,
+                )
+            total_bytes += len(image)
+        if total_bytes > MAX_VISION_DOCUMENT_BYTES:
+            raise VisionRequestError("文档渲染页面总大小超过 32 MiB", status_code=413)
         configured_model, api_key = self.settings.credentials()
         model = model_override or configured_model
         if model not in SUPPORTED_VISION_MODELS:
             raise VisionRequestError("不支持该 OpenAI 识图模型", status_code=422)
-        encoded = base64.b64encode(image).decode("ascii")
         classification_instruction = (
             "Classify only when the visual evidence is strong: income_voucher = sales invoice, "
             "POS/Z report, or credit invoice/Kreditfaktura; expense_voucher = supplier invoice, "
@@ -192,34 +222,58 @@ class OpenAIVisionClient:
             "classification was requested in classification.reason, and use an empty evidence "
             "array. Determine status only from whether the image can be read reliably."
         )
+        user_content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "Analyze exactly one financial document supplied as ordered rendered pages. Preserve "
+                    "page order, columns, tables, labels and values; never merge unrelated rows or amounts. "
+                    "Preserve all visible text and extract facts without guessing. Masked account/card "
+                    "numbers must retain every visible '*' and digit exactly. Extract the final paid or "
+                    "payable amount, ISO currency when visible, reference/OCR/payment identifiers, account "
+                    "or card numbers, transaction time, and payer/payee company names and organization/tax "
+                    "numbers. "
+                    + classification_instruction
+                    + " Use needs_reupload only when page quality prevents reliable reading. Return only "
+                    "data matching the supplied JSON schema."
+                ),
+            }
+        ]
+        if document_text:
+            user_content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "This layout-preserving text came directly from the PDF text layer. Page markers "
+                        "and order are authoritative. Use rendered pages to resolve columns, tables and "
+                        "visual conflicts; do not flatten adjacent columns into one row:\n\n"
+                        + document_text[:100_000]
+                    ),
+                }
+            )
+        for image, filename, content_type, page_number in pages:
+            encoded = base64.b64encode(image).decode("ascii")
+            user_content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": f"Rendered page {page_number}/{len(pages)} ({filename}).",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{content_type};base64,{encoded}",
+                            "detail": "high",
+                        },
+                    },
+                ]
+            )
         payload = {
             "model": model,
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Analyze exactly one financial document shown in this image. Preserve all "
-                                "visible text and extract facts without guessing. Masked account/card numbers "
-                                "must retain every visible '*' and digit exactly. Extract the final paid or "
-                                "payable amount, ISO currency when visible, reference/OCR/payment identifiers, "
-                                "account or card numbers, transaction time, and payer/payee company names and "
-                                "organization/tax numbers. "
-                                + classification_instruction
-                                + " Use needs_reupload only when image quality "
-                                "prevents reliable reading. Return only data matching the supplied JSON schema."
-                            ),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{content_type};base64,{encoded}",
-                                "detail": "high",
-                            },
-                        },
-                    ],
+                    "content": user_content,
                 }
             ],
             "response_format": {
@@ -408,9 +462,10 @@ class OpenAIVisionClient:
             "reasons": [str(value) for value in (result.get("reasons") or [])],
             "model": {"provider": "openai", "vision": response_model},
             "image": {
-                "filename": filename,
-                "content_type": content_type,
-                "size_bytes": len(image),
+                "filename": pages[0][1],
+                "content_type": pages[0][2],
+                "size_bytes": sum(len(page[0]) for page in pages),
+                "page_count": len(pages),
             },
             "receipts": [
                 {

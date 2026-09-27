@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from omni_ai_controller import service
 from omni_ai_controller.admin_account_store import PERMISSIONS, AdminAccountConflict
 from omni_ai_controller.service import ADMIN_CSRF_COOKIE, ADMIN_SESSION_COOKIE, ServiceSettings, create_app
 
@@ -257,6 +258,23 @@ class FakeVisionClient:
             "content_type": content_type,
         }
 
+    def recognize_document(
+        self,
+        pages: list[tuple[bytes, str, str, int]],
+        *,
+        document_text: str | None,
+        model_override: str | None = None,
+        classify: bool = True,
+    ) -> dict[str, object]:
+        return {
+            "request_id": "vision-document-1",
+            "status": "accepted",
+            "model": {"provider": "openai", "vision": model_override or "gpt-4o"},
+            "receipts": [{"index": 1, "text": document_text or "", "payment_candidates": []}],
+            "pages": [page_number for _, _, _, page_number in pages],
+            "classify": classify,
+        }
+
 
 def client(controller: FakeController | None = None, store: FakeAdminAccountStore | None = None) -> TestClient:
     settings = ServiceSettings(
@@ -404,6 +422,48 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert analyzed.json()["request_id"] == "vision-1"
         assert analyzed.json()["model"]["vision"] == "gpt-6-sol"
 
+        analyzed_pdf = test_client.post(
+            "/internal/vision/receipts",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "filename": "page-001.jpg",
+                        "content_type": "image/jpeg",
+                        "image_base64": base64.b64encode(b"page-one").decode("ascii"),
+                    },
+                    {
+                        "page_number": 2,
+                        "filename": "page-002.jpg",
+                        "content_type": "image/jpeg",
+                        "image_base64": base64.b64encode(b"page-two").decode("ascii"),
+                    },
+                ],
+                "document_text": "=== PDF PAGE 1/2 ===\nInvoice",
+                "model": "gpt-6-sol",
+                "classify": False,
+            },
+        )
+        assert analyzed_pdf.status_code == 200
+        assert analyzed_pdf.json()["request_id"] == "vision-document-1"
+        assert analyzed_pdf.json()["pages"] == [1, 2]
+        assert analyzed_pdf.json()["classify"] is False
+
+        invalid_pdf = test_client.post(
+            "/internal/vision/receipts",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "pages": [{
+                    "page_number": 2,
+                    "filename": "page-002.jpg",
+                    "content_type": "image/jpeg",
+                    "image_base64": base64.b64encode(b"page-two").decode("ascii"),
+                }],
+            },
+        )
+        assert invalid_pdf.status_code == 422
+
         rejected_classification = test_client.post(
             "/internal/quantization/classify",
             json={"text": "Invoice", "financial_facts": {}},
@@ -421,6 +481,34 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert classified.json()["status"] == "accepted"
         assert classified.json()["model"]["classifier"] == "test-qwen"
         assert classified.json()["classification"]["document_type"] == "expense_voucher"
+
+
+def test_internal_vision_rejects_document_total_before_forwarding(monkeypatch) -> None:
+    monkeypatch.setattr(service, "MAX_VISION_DOCUMENT_BYTES", 10)
+    with client() as test_client:
+        response = test_client.post(
+            "/internal/vision/receipts",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "filename": "page-001.jpg",
+                        "content_type": "image/jpeg",
+                        "image_base64": base64.b64encode(b"123456").decode("ascii"),
+                    },
+                    {
+                        "page_number": 2,
+                        "filename": "page-002.jpg",
+                        "content_type": "image/jpeg",
+                        "image_base64": base64.b64encode(b"abcdef").decode("ascii"),
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 413
+    assert "total" in response.json()["detail"]
 
 
 def test_internal_support_chat_uses_fixed_system_prompt() -> None:

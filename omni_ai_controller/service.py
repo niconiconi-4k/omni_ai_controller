@@ -39,6 +39,7 @@ from .conversation_store import (
 from .hardware import hardware_status
 from .metric_store import MetricCollector, MetricName, MetricRange, MetricStore, MetricStoreError
 from .vision import (
+    MAX_VISION_DOCUMENT_BYTES,
     MAX_VISION_IMAGE_BYTES,
     OpenAIVisionClient,
     VisionRequestError,
@@ -180,10 +181,19 @@ class VisionSettingsUpdate(BaseModel):
     api_key: SecretStr | None = Field(default=None)
 
 
-class VisionAnalyzeRequest(BaseModel):
+class VisionPageRequest(BaseModel):
+    page_number: int = Field(ge=1, le=12)
     filename: str = Field(min_length=1, max_length=255)
     content_type: Literal["image/jpeg", "image/png", "image/webp"]
     image_base64: str = Field(min_length=1, max_length=28_000_000)
+
+
+class VisionAnalyzeRequest(BaseModel):
+    filename: str | None = Field(default=None, min_length=1, max_length=255)
+    content_type: Literal["image/jpeg", "image/png", "image/webp"] | None = None
+    image_base64: str | None = Field(default=None, min_length=1, max_length=28_000_000)
+    pages: list[VisionPageRequest] | None = Field(default=None, min_length=1, max_length=12)
+    document_text: str | None = Field(default=None, max_length=100_000)
     model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] | None = None
     classify: bool = True
 
@@ -624,23 +634,78 @@ def create_app(
 
     @application.post("/internal/vision/receipts", dependencies=[vision_internal])
     def analyze_receipt(payload: VisionAnalyzeRequest) -> dict[str, object]:
-        try:
-            image = base64.b64decode(payload.image_base64, validate=True)
-        except (binascii.Error, ValueError) as exc:
+        legacy_supplied = any(
+            value is not None
+            for value in (payload.filename, payload.content_type, payload.image_base64)
+        )
+        if bool(payload.pages) == legacy_supplied:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Invalid base64 image",
-            ) from exc
-        if not image or len(image) > MAX_VISION_IMAGE_BYTES:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail="Vision image must be between 1 byte and 20 MiB",
+                detail="Provide either one image or an ordered page list",
+            )
+        decoded_pages: list[tuple[bytes, str, str, int]] = []
+        if payload.pages:
+            seen_page_numbers: set[int] = set()
+            total_decoded_bytes = 0
+            for page in payload.pages:
+                if page.page_number in seen_page_numbers:
+                    raise HTTPException(status_code=422, detail="PDF page numbers must be unique")
+                seen_page_numbers.add(page.page_number)
+                try:
+                    image = base64.b64decode(page.image_base64, validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"Invalid base64 image for page {page.page_number}",
+                    ) from exc
+                if not image or len(image) > MAX_VISION_IMAGE_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Vision page {page.page_number} must be between 1 byte and 20 MiB",
+                    )
+                total_decoded_bytes += len(image)
+                if total_decoded_bytes > MAX_VISION_DOCUMENT_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="Vision document pages exceed 32 MiB in total",
+                    )
+                decoded_pages.append(
+                    (image, Path(page.filename).name, page.content_type, page.page_number)
+                )
+            decoded_pages.sort(key=lambda item: item[3])
+            if [page[3] for page in decoded_pages] != list(range(1, len(decoded_pages) + 1)):
+                raise HTTPException(status_code=422, detail="PDF page numbers must be continuous from 1")
+        else:
+            if not payload.filename or not payload.content_type or not payload.image_base64:
+                raise HTTPException(status_code=422, detail="Single-image request is incomplete")
+            try:
+                image = base64.b64decode(payload.image_base64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Invalid base64 image",
+                ) from exc
+            if not image or len(image) > MAX_VISION_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail="Vision image must be between 1 byte and 20 MiB",
+                )
+            decoded_pages.append(
+                (image, Path(payload.filename).name, payload.content_type, 1)
             )
         try:
+            if payload.pages:
+                return active_vision_client.recognize_document(
+                    decoded_pages,
+                    document_text=payload.document_text,
+                    model_override=payload.model,
+                    classify=payload.classify,
+                )
+            image, filename, content_type, _ = decoded_pages[0]
             return active_vision_client.recognize(
                 image,
-                filename=payload.filename,
-                content_type=payload.content_type,
+                filename=filename,
+                content_type=content_type,
                 model_override=payload.model,
                 classify=payload.classify,
             )

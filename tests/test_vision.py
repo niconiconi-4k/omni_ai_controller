@@ -153,6 +153,39 @@ def test_openai_vision_requires_configuration(tmp_path: Path) -> None:
         client.recognize(b"image", filename="receipt.png", content_type="image/png")
 
 
+def test_openai_vision_sends_ordered_pdf_pages_and_layout_text(tmp_path: Path) -> None:
+    store = VisionSettingsStore(tmp_path / "vision.json")
+    store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
+    response = {
+        "id": "request-pdf-1",
+        "model": "gpt-6-sol",
+        "choices": [{"message": {"content": json.dumps({
+            "status": "accepted", "reasons": [], "text": "PAGE ONE\nPAGE TWO",
+            "payment_candidates": [],
+        })}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+    }
+
+    with patch("omni_ai_controller.vision.urlopen", return_value=FakeResponse(response)) as request:
+        result = OpenAIVisionClient(store).recognize_document(
+            [
+                (b"page-one", "page-001.jpg", "image/jpeg", 1),
+                (b"page-two", "page-002.jpg", "image/jpeg", 2),
+            ],
+            document_text="=== PDF PAGE 1/2 ===\nInvoice\n\n=== PDF PAGE 2/2 ===\nPaid",
+            model_override="gpt-6-sol",
+            classify=False,
+        )
+
+    sent_payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
+    content = sent_payload["messages"][0]["content"]
+    assert [item["type"] for item in content].count("image_url") == 2
+    assert "PDF PAGE 1/2" in content[1]["text"]
+    assert content[2]["text"].startswith("Rendered page 1/2")
+    assert content[4]["text"].startswith("Rendered page 2/2")
+    assert result["image"]["page_count"] == 2
+
+
 def test_gpt_6_sol_uses_compatible_chat_completion_parameters(tmp_path: Path) -> None:
     store = VisionSettingsStore(tmp_path / "vision.json")
     store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")

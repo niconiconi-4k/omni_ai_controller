@@ -142,7 +142,7 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 2. 选择 `gpt-4o`、`gpt-4.1` 或 `gpt-6-sol`，在密码输入框中填写自己的 OpenAI API 密钥。
 3. Controller 将密钥原子写入 `/etc/omni-ai-controller/openai-vision.json`，文件权限固定为 `0600`；GET 接口只返回 `configured` 状态，绝不返回密钥或密钥片段。
 4. 已分类凭证可逐次选择“PP-OCRv6 · 本地”或 OpenAI；未分类凭证固定由 GPT-6 Sol 读取，并可选择“纯 GPT”或“GPT 识图 + Qwen 本地分类”。主服务通过 Unix Socket 和独立内部令牌调用 Controller，只有 Controller 能读取 OpenAI 密钥并访问固定的 `https://api.openai.com/v1/chat/completions`。
-5. 图片选择 OpenAI 引擎时会发送给 OpenAI API；选择 PP-OCRv6 时图片保持在本机 Docker 网络内。单张 OpenAI 识图图片限制为 20 MiB。
+5. 图片选择 OpenAI 引擎时会发送给 OpenAI API；PDF 会作为最多 12 张连续编号的渲染页以及可用的布局文字层在一次文档请求中发送。选择 PP-OCRv6 时图片和 PDF 渲染页保持在本机 Docker 网络内。每张 OpenAI 识图页面限制为 20 MiB，整个渲染文档限制为 32 MiB。
 
 相关管理接口：
 
