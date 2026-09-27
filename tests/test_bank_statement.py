@@ -40,8 +40,6 @@ def test_statement_client_forces_gpt6_and_strict_transaction_schema(tmp_path: Pa
                 "currency": "SEK",
                 "period_start": "2026-09-01",
                 "period_end": "2026-09-30",
-                "opening_balance": "1000.00",
-                "closing_balance": "900.00",
             },
             "transactions": [{
                 "row_index": 1,
@@ -50,7 +48,6 @@ def test_statement_client_forces_gpt6_and_strict_transaction_schema(tmp_path: Pa
                 "transaction_time_text": None,
                 "amount": "-100.00",
                 "currency": "SEK",
-                "balance_after": "900.00",
                 "direction": "debit",
                 "description": "CARD PURCHASE",
                 "counterparty": "Shop AB",
@@ -82,6 +79,10 @@ def test_statement_client_forces_gpt6_and_strict_transaction_schema(tmp_path: Pa
     transaction_schema = sent_payload["response_format"]["json_schema"]["schema"]["properties"]["transactions"]["items"]
     assert transaction_schema["additionalProperties"] is False
     assert "verification_code" in transaction_schema["required"]
+    assert "balance_after" not in transaction_schema["properties"]
+    statement_schema = sent_payload["response_format"]["json_schema"]["schema"]["properties"]["statement"]
+    assert "opening_balance" not in statement_schema["properties"]
+    assert "closing_balance" not in statement_schema["properties"]
     prompt = sent_payload["messages"][0]["content"][0]["text"]
     assert "Ignore navigation" in prompt
     assert "Debit/outgoing amounts must be negative" in prompt

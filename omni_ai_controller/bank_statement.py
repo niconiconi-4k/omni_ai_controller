@@ -60,7 +60,8 @@ class OpenAIBankStatementClient:
                 "balances as transaction amounts. Preserve references, verification/control codes, masked account "
                 "numbers and descriptions exactly. Deduplicate page-overlap rows but never merge two legitimate "
                 "transactions with the same amount. Use ISO dates only when unambiguous. Report uncertainty rather "
-                "than inventing fields. The source file is " + filename + "."
+                "than inventing fields. Running, opening and closing balances are not needed: use them only to "
+                "understand the layout and never return them as transaction data. The source file is " + filename + "."
             ),
         }]
         if document_text.strip():
@@ -100,12 +101,10 @@ class OpenAIBankStatementClient:
                         "currency": nullable_string,
                         "period_start": nullable_string,
                         "period_end": nullable_string,
-                        "opening_balance": nullable_string,
-                        "closing_balance": nullable_string,
                     },
                     "required": [
                         "institution_name", "account_holder", "account_number", "iban", "bic",
-                        "currency", "period_start", "period_end", "opening_balance", "closing_balance",
+                        "currency", "period_start", "period_end",
                     ],
                 },
                 "transactions": {
@@ -120,7 +119,6 @@ class OpenAIBankStatementClient:
                             "transaction_time_text": nullable_string,
                             "amount": {"type": "string"},
                             "currency": nullable_string,
-                            "balance_after": nullable_string,
                             "direction": {"type": "string", "enum": ["credit", "debit", "neutral"]},
                             "description": {"type": "string"},
                             "counterparty": nullable_string,
@@ -133,7 +131,7 @@ class OpenAIBankStatementClient:
                         },
                         "required": [
                             "row_index", "booking_date", "value_date", "transaction_time_text", "amount",
-                            "currency", "balance_after", "direction", "description", "counterparty",
+                            "currency", "direction", "description", "counterparty",
                             "reference", "verification_code", "transaction_type", "source_page", "source_row",
                             "confidence",
                         ],

@@ -143,7 +143,7 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 3. Controller 将密钥原子写入 `/etc/omni-ai-controller/openai-vision.json`，文件权限固定为 `0600`；GET 接口只返回 `configured` 状态，绝不返回密钥或密钥片段。
 4. 已分类凭证可逐次选择“PP-OCRv6 · 本地”或 OpenAI；未分类凭证固定由 GPT-6 Sol 读取，并可选择“纯 GPT”或“GPT 识图 + Qwen 本地分类”。主服务通过 Unix Socket 和独立内部令牌调用 Controller，只有 Controller 能读取 OpenAI 密钥并访问固定的 `https://api.openai.com/v1/chat/completions`。
 5. 图片选择 OpenAI 引擎时会发送给 OpenAI API；PDF 会作为最多 12 张连续编号的渲染页以及可用的布局文字层在一次文档请求中发送。选择 PP-OCRv6 时图片和 PDF 渲染页保持在本机 Docker 网络内。每张 OpenAI 识图页面限制为 20 MiB，整个渲染文档限制为 32 MiB。
-6. 实验室银行流水固定使用 GPT-6 Sol，通过独立严格 JSON Schema 提取账户摘要和逐笔交易；PDF 最多 40 页，Excel/CSV 以带工作表、行号和列号的有序文本输入，模型必须忽略导航、广告、汇总和重复表头等干扰内容。
+6. 实验室银行流水固定使用 GPT-6 Sol，通过独立严格 JSON Schema 提取账户摘要和逐笔交易；PDF 最多 40 页，Excel/CSV 以带工作表、行号和列号的有序文本输入，模型必须忽略导航、广告、汇总、余额和重复表头等非交易数据。
 
 相关管理接口：
 
