@@ -4,6 +4,7 @@ import base64
 import binascii
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import threading
@@ -25,10 +26,8 @@ from .admin_account_store import (
 )
 from .admin_session import (
     issue_admin_session,
-    issue_trusted_browser,
     validate_admin_csrf,
     validate_admin_session,
-    validate_trusted_browser,
 )
 from .client import ServerRequestError
 from .config import ConfigurationError
@@ -52,7 +51,7 @@ LOGGER = logging.getLogger("omni_ai_controller.service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 ADMIN_SESSION_COOKIE = "omni_admin_session"
 ADMIN_CSRF_COOKIE = "omni_admin_csrf"
-ADMIN_TRUSTED_BROWSER_COOKIE = "omni_admin_trusted_browser"
+ADMIN_CREDENTIAL_BUNDLE_PREFIX = "omni-admin-v1."
 SUPPORT_SYSTEM_PROMPT = """你是 Omni AI 财务审计门户的在线客服。请始终使用专业、礼貌、简洁的中文回答。
 
 你只能基于以下已确认事实回答：
@@ -73,7 +72,6 @@ class ServiceSettings:
     allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     allowed_containers: tuple[str, ...]
     admin_session_ttl_hours: int = 12
-    admin_trusted_browser_ttl_days: int = 30
     database_host: str = "127.0.0.1"
     database_port: int = 15432
     database_name: str = "omni_ai"
@@ -108,16 +106,12 @@ class ServiceSettings:
         session_ttl_hours = int(os.getenv("OMNI_ADMIN_SESSION_TTL_HOURS", "12"))
         if session_ttl_hours < 1 or session_ttl_hours > 168:
             raise RuntimeError("OMNI_ADMIN_SESSION_TTL_HOURS 必须介于 1 和 168 之间")
-        trusted_browser_ttl_days = int(os.getenv("OMNI_ADMIN_TRUSTED_BROWSER_TTL_DAYS", "30"))
-        if trusted_browser_ttl_days < 1 or trusted_browser_ttl_days > 365:
-            raise RuntimeError("OMNI_ADMIN_TRUSTED_BROWSER_TTL_DAYS 必须介于 1 和 365 之间")
         return cls(
             model_dir=Path(os.getenv("OMNI_MODEL_DIR", "/opt/ai_server/omni_ai_model")),
             admin_token=os.getenv("OMNI_ADMIN_TOKEN", ""),
             allowed_networks=networks,
             allowed_containers=containers,
             admin_session_ttl_hours=session_ttl_hours,
-            admin_trusted_browser_ttl_days=trusted_browser_ttl_days,
             database_host=os.getenv("OMNI_CONVERSATION_DATABASE_HOST", "127.0.0.1"),
             database_port=int(os.getenv("OMNI_CONVERSATION_DATABASE_PORT", "15432")),
             database_name=os.getenv("DATABASE_NAME", "omni_ai"),
@@ -374,8 +368,7 @@ def create_app(
         *,
         username: str,
         password: str,
-        token: str = "",
-        trusted: dict[str, str | int] | None = None,
+        token: str,
     ) -> dict[str, object]:
         attempt_key = f"{_client_ip(request)}:{username.casefold()}"
         now = time.monotonic()
@@ -387,15 +380,7 @@ def create_app(
                 login_attempts.clear()
             login_attempts[attempt_key] = recent
         try:
-            if trusted is not None:
-                account = active_admin_accounts.authenticate_trusted(
-                    username,
-                    password,
-                    str(trusted["account_id"]),
-                    int(trusted["version"]),
-                )
-            else:
-                account = active_admin_accounts.authenticate(username, password, token)
+            account = active_admin_accounts.authenticate(username, password, token)
         except AdminAccountError as exc:
             raise HTTPException(status_code=503, detail="Administrator authentication unavailable") from exc
         if account is None:
@@ -450,6 +435,23 @@ def create_app(
         query = urlencode({"next": destination, "error": code})
         return RedirectResponse(f"/admin-login/?{query}", status_code=status.HTTP_303_SEE_OTHER)
 
+    def decode_browser_credential(password: str, token: str) -> tuple[str, str]:
+        if not password.startswith(ADMIN_CREDENTIAL_BUNDLE_PREFIX):
+            return password, token
+        encoded = password.removeprefix(ADMIN_CREDENTIAL_BUNDLE_PREFIX)
+        try:
+            raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            payload = json.loads(raw.decode("utf-8"))
+            bundled_password = payload["password"]
+            bundled_token = payload["token"]
+            if payload.get("version") != 1:
+                raise ValueError
+            if not isinstance(bundled_password, str) or not isinstance(bundled_token, str):
+                raise ValueError
+            return bundled_password, bundled_token
+        except (binascii.Error, UnicodeDecodeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid browser credential bundle") from exc
+
     @application.post("/auth/login")
     def admin_login(payload: AdminLoginRequest, response: Response, request: Request) -> dict[str, str]:
         if not active_settings.admin_token:
@@ -470,7 +472,7 @@ def create_app(
             return browser_login_error("/dashboard/", "unavailable")
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         body = await request.body()
-        if content_type != "application/x-www-form-urlencoded" or len(body) > 4096:
+        if content_type != "application/x-www-form-urlencoded" or len(body) > 8192:
             return browser_login_error("/dashboard/", "invalid")
         try:
             values = parse_qs(body.decode("utf-8"), keep_blank_values=True, strict_parsing=True)
@@ -478,92 +480,31 @@ def create_app(
             password = values["password"][0]
             token = values.get("token", [""])[0].strip()
             destination = safe_admin_destination(values.get("next", [""])[0])
-            remember_browser = values.get("remember_browser", [""])[0] == "yes"
             if len(values["username"]) != 1 or len(values["password"]) != 1:
                 raise ValueError
+            password, token = decode_browser_credential(password, token)
             if not 1 <= len(username) <= 128 or not 1 <= len(password) <= 1024 or len(token) > 1024:
                 raise ValueError
         except (KeyError, UnicodeDecodeError, ValueError):
             return browser_login_error("/dashboard/", "invalid")
 
-        trusted = validate_trusted_browser(
-            active_settings.admin_token,
-            request.cookies.get(ADMIN_TRUSTED_BROWSER_COOKIE, ""),
-        )
+        if not token:
+            return browser_login_error(destination, "token_required")
         try:
-            if token:
-                account = authenticate_admin(
-                    request,
-                    username=username,
-                    password=password,
-                    token=token,
-                )
-            elif trusted is not None:
-                account = authenticate_admin(
-                    request,
-                    username=username,
-                    password=password,
-                    trusted=trusted,
-                )
-            else:
-                return browser_login_error(destination, "token_required")
+            account = authenticate_admin(
+                request,
+                username=username,
+                password=password,
+                token=token,
+            )
         except HTTPException as exc:
             error_code = "rate_limited" if exc.status_code == 429 else "invalid"
             return browser_login_error(destination, error_code)
 
         response = RedirectResponse(destination, status_code=status.HTTP_303_SEE_OTHER)
         set_admin_session_cookies(response, account)
-        if remember_browser:
-            trusted_token = issue_trusted_browser(
-                active_settings.admin_token,
-                active_settings.admin_trusted_browser_ttl_days,
-                str(account["id"]),
-                int(account["auth_version"]),
-            )
-            response.set_cookie(
-                ADMIN_TRUSTED_BROWSER_COOKIE,
-                trusted_token,
-                max_age=active_settings.admin_trusted_browser_ttl_days * 86400,
-                secure=True,
-                httponly=True,
-                samesite="strict",
-                path="/dashboard",
-            )
-        else:
-            response.delete_cookie(
-                ADMIN_TRUSTED_BROWSER_COOKIE,
-                path="/dashboard",
-                secure=True,
-                httponly=True,
-                samesite="strict",
-            )
         LOGGER.info("admin browser login succeeded client=%s", _client_ip(request))
         return response
-
-    @application.get("/auth/trusted-browser")
-    def trusted_browser_status(request: Request, response: Response) -> dict[str, object]:
-        trusted = validate_trusted_browser(
-            active_settings.admin_token,
-            request.cookies.get(ADMIN_TRUSTED_BROWSER_COOKIE, ""),
-        )
-        if trusted is None:
-            return {"trusted": False}
-        try:
-            account = active_admin_accounts.session_account(
-                str(trusted["account_id"]), int(trusted["version"])
-            )
-        except AdminAccountError:
-            return {"trusted": False}
-        if account is None:
-            response.delete_cookie(
-                ADMIN_TRUSTED_BROWSER_COOKIE,
-                path="/dashboard",
-                secure=True,
-                httponly=True,
-                samesite="strict",
-            )
-            return {"trusted": False}
-        return {"trusted": True, "username": account["username"]}
 
     @application.get("/auth/check", status_code=status.HTTP_204_NO_CONTENT, dependencies=[admin])
     def admin_check() -> Response:

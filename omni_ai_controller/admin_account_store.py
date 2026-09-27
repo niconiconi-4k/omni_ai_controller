@@ -132,51 +132,6 @@ class AdminAccountStore:
         except psycopg.Error as exc:
             raise AdminAccountError("Unable to authenticate administrator") from exc
 
-    def authenticate_trusted(
-        self,
-        username: str,
-        password: str,
-        account_id: str,
-        version: int,
-    ) -> dict[str, Any] | None:
-        try:
-            with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:
-                cursor.execute(
-                    "SELECT * FROM controller_admin_accounts WHERE lower(username) = lower(%s)",
-                    (username,),
-                )
-                row = cursor.fetchone()
-                if not row:
-                    self._verify_password(self.dummy_hash, password)
-                    return None
-                if row["locked_until"] and row["locked_until"] > datetime.now(timezone.utc):
-                    return None
-                valid = self._verify_password(row["password_hash"], password)
-                valid = valid & hmac.compare_digest(str(row["id"]).encode(), account_id.encode())
-                valid = valid & hmac.compare_digest(row["username"].casefold(), username.casefold())
-                valid = valid & (int(row["auth_version"]) == version)
-                if not valid:
-                    if not row["is_super"]:
-                        cursor.execute(
-                            """UPDATE controller_admin_accounts SET
-                               failed_attempts = failed_attempts + 1,
-                               locked_until = CASE WHEN failed_attempts + 1 >= 5
-                                 THEN CURRENT_TIMESTAMP + INTERVAL '15 minutes'
-                                 ELSE NULL END
-                               WHERE id = %s""",
-                            (row["id"],),
-                        )
-                    return None
-                if not row["is_super"]:
-                    cursor.execute(
-                        """UPDATE controller_admin_accounts SET failed_attempts = 0,
-                           locked_until = NULL WHERE id = %s""",
-                        (row["id"],),
-                    )
-                return self.public(row) | {"auth_version": row["auth_version"]}
-        except psycopg.Error as exc:
-            raise AdminAccountError("Unable to authenticate trusted administrator") from exc
-
     def session_account(self, account_id: str, version: int) -> dict[str, Any] | None:
         try:
             with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:

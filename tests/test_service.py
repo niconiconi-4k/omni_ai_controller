@@ -1,3 +1,4 @@
+import base64
 import ipaddress
 import json
 from pathlib import Path
@@ -6,13 +7,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from omni_ai_controller.admin_account_store import PERMISSIONS, AdminAccountConflict
-from omni_ai_controller.service import (
-    ADMIN_CSRF_COOKIE,
-    ADMIN_SESSION_COOKIE,
-    ADMIN_TRUSTED_BROWSER_COOKIE,
-    ServiceSettings,
-    create_app,
-)
+from omni_ai_controller.service import ADMIN_CSRF_COOKIE, ADMIN_SESSION_COOKIE, ServiceSettings, create_app
 
 
 class FakeAdminAccountStore:
@@ -27,20 +22,6 @@ class FakeAdminAccountStore:
             return self.accounts["super"]
         if username == "limited" and password == "limited-password-123" and token == "limited-token":
             return self.accounts.get("limited")
-        return None
-
-    def authenticate_trusted(
-        self, username: str, password: str, account_id: str, version: int
-    ):  # type: ignore[no-untyped-def]
-        account = self.accounts.get(account_id)
-        expected_password = "test-password-123" if account_id == "super" else "limited-password-123"
-        if (
-            account
-            and account["username"].casefold() == username.casefold()
-            and password == expected_password
-            and account["auth_version"] == version
-        ):
-            return account
         return None
 
     def session_account(self, account_id: str, version: int):  # type: ignore[no-untyped-def]
@@ -400,8 +381,6 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert switched.status_code == 200
         assert switched.json()["model"] == "gpt-6-sol"
 
-        import base64
-
         rejected = test_client.post(
             "/internal/vision/receipts",
             json={
@@ -620,7 +599,7 @@ def test_browser_admin_session_requires_key_and_csrf() -> None:
         assert test_client.get("/auth/check", headers=network_headers).status_code == 401
 
 
-def test_native_admin_login_securely_remembers_token() -> None:
+def test_native_admin_login_accepts_chrome_credential_bundle() -> None:
     network_headers = {"X-Forwarded-For": "192.168.192.10"}
     with client() as test_client:
         test_client.cookies.clear()
@@ -631,7 +610,6 @@ def test_native_admin_login_securely_remembers_token() -> None:
                 "username": "Mutsu",
                 "password": "test-password-123",
                 "token": "test-personal-token",
-                "remember_browser": "yes",
                 "next": "/dashboard/support/?state=open",
             },
             follow_redirects=False,
@@ -641,31 +619,21 @@ def test_native_admin_login_securely_remembers_token() -> None:
         set_cookie = login.headers.get_list("set-cookie")
         assert any(f"{ADMIN_SESSION_COOKIE}=" in item and "HttpOnly" in item for item in set_cookie)
         assert any(f"{ADMIN_CSRF_COOKIE}=" in item for item in set_cookie)
-        assert any(
-            f"{ADMIN_TRUSTED_BROWSER_COOKIE}=" in item
-            and "HttpOnly" in item
-            and "Secure" in item
-            and "Path=/dashboard" in item
-            for item in set_cookie
-        )
         assert "test-personal-token" not in "".join(set_cookie)
-        trusted_cookie = login.cookies.get(ADMIN_TRUSTED_BROWSER_COOKIE)
-
-        trusted = test_client.get(
-            "/auth/trusted-browser",
-            headers={**network_headers, "Cookie": f"{ADMIN_TRUSTED_BROWSER_COOKIE}={trusted_cookie}"},
-        )
-        assert trusted.json() == {"trusted": True, "username": "Mutsu"}
 
         test_client.cookies.clear()
+        payload = json.dumps(
+            {"version": 1, "password": "test-password-123", "token": "test-personal-token"},
+            separators=(",", ":"),
+        ).encode()
+        credential = "omni-admin-v1." + base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
         repeated = test_client.post(
             "/auth/login/browser",
-            headers={**network_headers, "Cookie": f"{ADMIN_TRUSTED_BROWSER_COOKIE}={trusted_cookie}"},
+            headers=network_headers,
             data={
                 "username": "Mutsu",
-                "password": "test-password-123",
+                "password": credential,
                 "token": "",
-                "remember_browser": "yes",
                 "next": "https://evil.example/steal",
             },
             follow_redirects=False,
@@ -674,7 +642,7 @@ def test_native_admin_login_securely_remembers_token() -> None:
         assert repeated.headers["location"] == "/dashboard/"
 
 
-def test_native_admin_login_requires_token_without_trusted_browser() -> None:
+def test_native_admin_login_requires_token_without_credential_bundle() -> None:
     with client() as test_client:
         test_client.cookies.clear()
         response = test_client.post(
@@ -684,7 +652,6 @@ def test_native_admin_login_requires_token_without_trusted_browser() -> None:
                 "username": "Mutsu",
                 "password": "test-password-123",
                 "token": "",
-                "remember_browser": "yes",
                 "next": "/dashboard/",
             },
             follow_redirects=False,
