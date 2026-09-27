@@ -12,7 +12,7 @@ from omni_ai_controller.voucher_classifier import (
 class FakeClient:
     def __init__(self, content: str) -> None:
         self.content = content
-        self.config = SimpleNamespace(model_name="qwen3.6-27b-instruct")
+        self.config = SimpleNamespace(model_name="qwen3.8-27b-instruct")
         self.messages = None
         self.schema = None
 
@@ -41,7 +41,7 @@ def test_classify_voucher_returns_allowlisted_result() -> None:
     )
 
     assert result["classification"]["document_type"] == "expense_voucher"
-    assert result["model"] == "qwen3.6-27b-instruct"
+    assert result["model"] == "qwen3.8-27b-instruct"
     assert result["usage"]["total_tokens"] == 42
     assert "未经信任" in client.messages[0]["content"]
     assert "bank_voucher" not in client.schema["properties"]["document_type"]["enum"]

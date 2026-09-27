@@ -65,7 +65,7 @@ class ServerConfig:
             base_url=f"http://127.0.0.1:{port}",
             api_key=values.get("OPENAI_API_KEY", ""),
             control_token=values.get("CONTROL_TOKEN", ""),
-            model_name=values.get("SERVED_MODEL_NAME", "qwen3.6-27b-instruct"),
+            model_name=values.get("SERVED_MODEL_NAME", "qwen3.8-27b-instruct"),
         )
 
     def require_credentials(self) -> None:

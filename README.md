@@ -134,7 +134,7 @@ Dashboard 对话保存在 PostgreSQL 的 `ai_conversations` 和 `ai_messages` �
 | [`gpt-4.1`](https://developers.openai.com/api/docs/models/gpt-4.1) | 非推理模型，约 1M token 上下文，擅长指令遵循 | 支持 | **可选视觉模型** |
 | [`gpt-4o`](https://developers.openai.com/api/docs/models/gpt-4o) | 成熟的多模态模型，128K token 上下文 | 支持 | **默认视觉模型** |
 
-系统目前只在凭证识图中开放 `gpt-4o`、`gpt-4.1` 和 `gpt-6-sol`，默认 `vision_model = "gpt-4o"`。这是刻意设置的服务端白名单：避免管理员输入任意模型名或外部 API 地址。公司 `0` 的未分类凭证流程会在受保护的内部请求中逐次覆盖为 `gpt-6-sol`，不修改全局选择；严格 JSON 契约返回 OCR 原文、金额/币种、参考号、保留星号的账户或卡号、交易时间及付款方/收款方。管理员可选择由 GPT 同时完成五类粗分类，或要求 GPT 跳过分类并由本地 `qwen3.6-27b-instruct` 依据提取结果分类。GPT-6 Sol 通过 Chat Completions 使用 `reasoning_effort = "none"` 和 `max_completion_tokens`。模型目录会随 OpenAI 调整，升级白名单前应重新核对模型可用性、价格和弃用公告。
+系统目前只在凭证识图中开放 `gpt-4o`、`gpt-4.1` 和 `gpt-6-sol`，默认 `vision_model = "gpt-4o"`。这是刻意设置的服务端白名单：避免管理员输入任意模型名或外部 API 地址。公司 `0` 的未分类凭证流程会在受保护的内部请求中逐次覆盖为 `gpt-6-sol`，不修改全局选择；严格 JSON 契约返回 OCR 原文、金额/币种、参考号、保留星号的账户或卡号、交易时间及付款方/收款方。管理员可选择由 GPT 同时完成五类粗分类，或要求 GPT 跳过分类并由默认本地 `qwen3.8-27b-instruct`（Qwen3.6 可作备选）依据提取结果分类。GPT-6 Sol 通过 Chat Completions 使用 `reasoning_effort = "none"` 和 `max_completion_tokens`。模型目录会随 OpenAI 调整，升级白名单前应重新核对模型可用性、价格和弃用公告。
 
 配置和调用流程：
 
