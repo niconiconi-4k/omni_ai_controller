@@ -1082,12 +1082,12 @@ def create_app(
             mutsu_context(account), ensure_ascii=False, default=str, separators=(",", ":")
         )
         fixed = [
-            {"role": "system", "content": MUTSU_SYSTEM_PROMPT},
             {
                 "role": "system",
-                "content": "以下 JSON 由服务端生成，是本轮唯一可信的管理员上下文：\n"
+                "content": MUTSU_SYSTEM_PROMPT
+                + "\n\n以下 JSON 由服务端生成，是本轮唯一可信的管理员上下文：\n"
                 + administrator_context,
-            },
+            }
         ]
 
         def estimated_tokens(messages: list[dict[str, str]]) -> int:

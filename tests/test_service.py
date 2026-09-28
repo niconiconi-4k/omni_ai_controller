@@ -929,7 +929,12 @@ def test_mutsu_is_available_to_limited_admin_and_isolates_conversations() -> Non
             json={"content": "我能管理什么？", "enable_thinking": False},
         )
         assert response.status_code == 200
-        context = controller.chat_messages[1]["content"]
+        assert [
+            index
+            for index, message in enumerate(controller.chat_messages)
+            if message["role"] == "system"
+        ] == [0]
+        context = controller.chat_messages[0]["content"]
         assert "support.manage" in context
         assert "services.control" not in context
 
