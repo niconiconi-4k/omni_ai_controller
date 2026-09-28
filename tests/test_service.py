@@ -8,7 +8,11 @@ from fastapi.testclient import TestClient
 
 from omni_ai_controller import service
 from omni_ai_controller.admin_account_store import PERMISSIONS, AdminAccountConflict
-from omni_ai_controller.conversation_store import ConversationNotFoundError
+from omni_ai_controller.client import ServerRequestError
+from omni_ai_controller.conversation_store import (
+    ConversationBusyError,
+    ConversationNotFoundError,
+)
 from omni_ai_controller.service import ADMIN_CSRF_COOKIE, ADMIN_SESSION_COOKIE, ServiceSettings, create_app
 
 
@@ -165,18 +169,17 @@ class FakeConversationStore:
     def __init__(self) -> None:
         self.items: dict[str, dict[str, object]] = {}
         self.messages: dict[str, list[dict[str, object]]] = {}
+        self.mutsu_items: dict[str, dict[str, object]] = {}
+        self.mutsu_messages: dict[str, list[dict[str, object]]] = {}
+        self.mutsu_busy: set[str] = set()
         self.counter = 0
 
-    def list_conversations(self, owner_admin_id: str) -> list[dict[str, object]]:
-        return [
-            item for item in reversed(self.items.values())
-            if item["owner_admin_id"] == owner_admin_id
-        ]
+    def list_conversations(self) -> list[dict[str, object]]:
+        return list(reversed(self.items.values()))
 
     def create_conversation(
         self,
         *,
-        owner_admin_id: str,
         title: str,
         model_name: str | None,
         enable_thinking: bool,
@@ -185,7 +188,6 @@ class FakeConversationStore:
         conversation_id = f"conversation-{self.counter}"
         conversation = {
             "id": conversation_id,
-            "owner_admin_id": owner_admin_id,
             "title": title,
             "model_name": model_name,
             "enable_thinking": enable_thinking,
@@ -196,24 +198,14 @@ class FakeConversationStore:
         self.messages[conversation_id] = []
         return conversation
 
-    def get_conversation(
-        self, conversation_id: str, owner_admin_id: str
-    ) -> dict[str, object]:
-        if self.items[conversation_id]["owner_admin_id"] != owner_admin_id:
-            raise ConversationNotFoundError("对话不存在")
+    def get_conversation(self, conversation_id: str) -> dict[str, object]:
         return {**self.items[conversation_id], "messages": self.messages[conversation_id]}
 
-    def rename_conversation(
-        self, conversation_id: str, title: str, owner_admin_id: str
-    ) -> dict[str, object]:
-        if self.items[conversation_id]["owner_admin_id"] != owner_admin_id:
-            raise ConversationNotFoundError("对话不存在")
+    def rename_conversation(self, conversation_id: str, title: str) -> dict[str, object]:
         self.items[conversation_id]["title"] = title
         return self.items[conversation_id]
 
-    def delete_conversation(self, conversation_id: str, owner_admin_id: str) -> None:
-        if self.items[conversation_id]["owner_admin_id"] != owner_admin_id:
-            raise ConversationNotFoundError("对话不存在")
+    def delete_conversation(self, conversation_id: str) -> None:
         del self.items[conversation_id]
         del self.messages[conversation_id]
 
@@ -221,13 +213,10 @@ class FakeConversationStore:
         self,
         conversation_id: str,
         *,
-        owner_admin_id: str,
         content: str,
         model_name: str | None,
         enable_thinking: bool,
     ) -> tuple[dict[str, object], dict[str, object], list[dict[str, str]]]:
-        if self.items[conversation_id]["owner_admin_id"] != owner_admin_id:
-            raise ConversationNotFoundError("对话不存在")
         message = {"id": "user-1", "role": "user", "content": content, "reasoning_content": ""}
         self.messages[conversation_id].append(message)
         if self.items[conversation_id]["title"] == "新对话":
@@ -242,13 +231,10 @@ class FakeConversationStore:
         self,
         conversation_id: str,
         *,
-        owner_admin_id: str,
         content: str,
         reasoning_content: str,
         model_name: str | None,
     ) -> tuple[dict[str, object], dict[str, object]]:
-        if self.items[conversation_id]["owner_admin_id"] != owner_admin_id:
-            raise ConversationNotFoundError("对话不存在")
         message = {
             "id": "assistant-1",
             "role": "assistant",
@@ -259,6 +245,72 @@ class FakeConversationStore:
         self.items[conversation_id]["message_count"] = len(self.messages[conversation_id])
         self.items[conversation_id]["last_message"] = content
         return self.items[conversation_id], message
+
+    def get_mutsu_conversation(self, owner_admin_id: str) -> dict[str, object]:
+        if owner_admin_id not in self.mutsu_items:
+            self.mutsu_items[owner_admin_id] = {
+                "id": f"mutsu-{owner_admin_id}",
+                "title": "陆奥",
+                "model_name": "test-qwen",
+                "enable_thinking": True,
+                "ai_responding": False,
+            }
+            self.mutsu_messages[owner_admin_id] = []
+        return {
+            **self.mutsu_items[owner_admin_id],
+            "messages": list(self.mutsu_messages[owner_admin_id]),
+        }
+
+    def start_mutsu_turn(
+        self,
+        owner_admin_id: str,
+        *,
+        content: str,
+        model_name: str | None,
+        enable_thinking: bool,
+    ) -> dict[str, object]:
+        conversation = self.get_mutsu_conversation(owner_admin_id)
+        if owner_admin_id in self.mutsu_busy:
+            raise ConversationBusyError("陆奥正在处理你的上一条消息")
+        self.mutsu_busy.add(owner_admin_id)
+        message = {
+            "id": f"mutsu-user-{len(self.mutsu_messages[owner_admin_id]) + 1}",
+            "role": "user",
+            "content": content,
+            "reasoning_content": "",
+        }
+        self.mutsu_messages[owner_admin_id].append(message)
+        return {
+            "conversation": conversation,
+            "user_message": message,
+            "run_id": f"run-{owner_admin_id}",
+            "context": [
+                {"role": item["role"], "content": item["content"]}
+                for item in self.mutsu_messages[owner_admin_id]
+            ],
+        }
+
+    def finish_mutsu_turn(
+        self,
+        owner_admin_id: str,
+        run_id: str,
+        *,
+        content: str,
+        reasoning_content: str,
+        model_name: str | None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        message = {
+            "id": f"mutsu-assistant-{len(self.mutsu_messages[owner_admin_id]) + 1}",
+            "role": "assistant",
+            "content": content,
+            "reasoning_content": reasoning_content,
+        }
+        self.mutsu_messages[owner_admin_id].append(message)
+        self.mutsu_busy.discard(owner_admin_id)
+        return self.get_mutsu_conversation(owner_admin_id), message
+
+    def fail_mutsu_turn(self, owner_admin_id: str, run_id: str) -> None:
+        self.mutsu_busy.discard(owner_admin_id)
 
 
 class FakeMetricStore:
@@ -819,10 +871,8 @@ def test_persisted_conversation_lifecycle() -> None:
         assert response.json()["conversation"]["title"] == "检查模型状态"
         assert response.json()["user_message"]["role"] == "user"
         assert response.json()["assistant_message"]["content"] == "你好"
-        assert controller.chat_messages[0]["role"] == "system"
-        assert "管理员智能体“陆奥”" in controller.chat_messages[0]["content"]
-        assert '"permissions"' in controller.chat_messages[1]["content"]
-        assert controller.chat_max_tokens == 4096
+        assert controller.chat_messages == [{"role": "user", "content": "检查模型状态"}]
+        assert controller.chat_max_tokens is None
 
         detail = test_client.get(f"/conversations/{conversation_id}", headers=headers())
         assert [item["role"] for item in detail.json()["conversation"]["messages"]] == [
@@ -868,15 +918,13 @@ def test_mutsu_is_available_to_limited_admin_and_isolates_conversations() -> Non
             "X-Forwarded-For": "192.168.192.10",
             "X-CSRF-Token": limited_login.json()["csrf_token"],
         }
-        created = test_client.post(
-            "/conversations",
-            headers=limited_headers,
-            json={"title": "陆奥测试", "enable_thinking": False},
-        )
-        assert created.status_code == 201
-        conversation_id = created.json()["conversation"]["id"]
+        assert test_client.get("/conversations", headers=limited_headers).status_code == 403
+        first = test_client.get("/mutsu/conversation", headers=limited_headers)
+        second = test_client.get("/mutsu/conversation", headers=limited_headers)
+        assert first.status_code == 200
+        assert first.json()["conversation"]["id"] == second.json()["conversation"]["id"]
         response = test_client.post(
-            f"/conversations/{conversation_id}/chat",
+            "/mutsu/messages",
             headers=limited_headers,
             json={"content": "我能管理什么？", "enable_thinking": False},
         )
@@ -895,23 +943,21 @@ def test_mutsu_is_available_to_limited_admin_and_isolates_conversations() -> Non
             },
         )
         assert super_login.status_code == 200
-        assert test_client.get(
-            f"/conversations/{conversation_id}",
+        super_conversation = test_client.get(
+            "/mutsu/conversation",
             headers={"X-Forwarded-For": "192.168.192.10"},
-        ).status_code == 404
+        )
+        assert super_conversation.status_code == 200
+        assert super_conversation.json()["conversation"]["id"] != first.json()["conversation"]["id"]
+        assert super_conversation.json()["conversation"]["messages"] == []
 
 
 def test_mutsu_trims_history_to_model_context_budget() -> None:
     controller = FakeController()
     conversation_store = FakeConversationStore()
     with client(controller=controller, conversation_store=conversation_store) as test_client:
-        created = test_client.post(
-            "/conversations",
-            headers=headers(),
-            json={"title": "长对话", "enable_thinking": False},
-        )
-        conversation_id = created.json()["conversation"]["id"]
-        conversation_store.messages[conversation_id] = [
+        conversation_store.get_mutsu_conversation("super")
+        conversation_store.mutsu_messages["super"] = [
             {
                 "id": f"history-{index}",
                 "role": "assistant" if index % 2 else "user",
@@ -921,7 +967,7 @@ def test_mutsu_trims_history_to_model_context_budget() -> None:
             for index in range(32)
         ]
         response = test_client.post(
-            f"/conversations/{conversation_id}/chat",
+            "/mutsu/messages",
             headers=headers(),
             json={"content": "检查上下文预算", "enable_thinking": False},
         )
@@ -935,29 +981,56 @@ def test_mutsu_trims_history_to_model_context_budget() -> None:
 
 
 def test_mutsu_rejects_a_second_request_for_the_same_admin() -> None:
-    with client() as test_client:
-        created = test_client.post(
-            "/conversations",
+    conversation_store = FakeConversationStore()
+    conversation_store.get_mutsu_conversation("super")
+    conversation_store.mutsu_busy.add("super")
+    with client(conversation_store=conversation_store) as test_client:
+        response = test_client.post(
+            "/mutsu/messages",
             headers=headers(),
-            json={"title": "并发检查", "enable_thinking": False},
+            json={"content": "第二条消息", "enable_thinking": False},
         )
-        conversation_id = created.json()["conversation"]["id"]
-        with service.MUTSU_LOCKS_GUARD:
-            lock = service.MUTSU_ADMIN_LOCKS.setdefault("super", service.threading.Lock())
-        lock.acquire()
-        try:
-            response = test_client.post(
-                f"/conversations/{conversation_id}/chat",
-                headers=headers(),
-                json={"content": "第二条消息", "enable_thinking": False},
-            )
-        finally:
-            lock.release()
-            with service.MUTSU_LOCKS_GUARD:
-                service.MUTSU_ADMIN_LOCKS.pop("super", None)
 
         assert response.status_code == 409
-        assert response.json()["detail"] == "陆奥正在处理你的另一条消息"
+        assert response.json()["detail"] == "陆奥正在处理你的上一条消息"
+
+
+def test_mutsu_clears_in_flight_state_after_model_failure() -> None:
+    controller = FakeController()
+    conversation_store = FakeConversationStore()
+
+    def fail_chat(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ServerRequestError("模型暂时不可用")
+
+    controller.model_server.client.chat = fail_chat
+    with client(controller=controller, conversation_store=conversation_store) as test_client:
+        response = test_client.post(
+            "/mutsu/messages",
+            headers=headers(),
+            json={"content": "检查服务", "enable_thinking": True},
+        )
+        assert response.status_code == 502
+        assert "super" not in conversation_store.mutsu_busy
+
+
+def test_mutsu_clears_in_flight_state_after_unexpected_failure() -> None:
+    controller = FakeController()
+    conversation_store = FakeConversationStore()
+
+    def fail_chat(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("unexpected model failure")
+
+    controller.model_server.client.chat = fail_chat
+    with client(controller=controller, conversation_store=conversation_store) as test_client:
+        try:
+            test_client.post(
+                "/mutsu/messages",
+                headers=headers(),
+                json={"content": "检查服务", "enable_thinking": True},
+            )
+        except RuntimeError:
+            pass
+        assert "super" not in conversation_store.mutsu_busy
 
 
 def test_browser_admin_session_requires_key_and_csrf() -> None:
