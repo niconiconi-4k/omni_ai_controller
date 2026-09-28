@@ -66,6 +66,7 @@ class ModelServerClient:
         messages: list[dict[str, str]],
         *,
         enable_thinking: bool,
+        max_tokens: int | None = None,
     ) -> ChatResult:
         self.config.require_credentials()
         payload = {
@@ -74,6 +75,8 @@ class ModelServerClient:
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         data = self._request(
             "POST",
             "/v1/chat/completions",

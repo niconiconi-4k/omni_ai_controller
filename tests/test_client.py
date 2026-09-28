@@ -57,6 +57,21 @@ def test_chat_rejects_invalid_response() -> None:
             )
 
 
+def test_chat_applies_optional_output_limit() -> None:
+    response = {"choices": [{"message": {"content": "完成"}}]}
+    with patch(
+        "omni_ai_controller.client.urlopen", return_value=FakeResponse(response)
+    ) as request:
+        ModelServerClient(config()).chat(
+            [{"role": "user", "content": "你好"}],
+            enable_thinking=False,
+            max_tokens=4096,
+        )
+
+    payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
+    assert payload["max_tokens"] == 4096
+
+
 def test_chat_json_sends_strict_schema() -> None:
     response = {"id": "local-1", "choices": [{"message": {"content": "{}"}}]}
     with patch(

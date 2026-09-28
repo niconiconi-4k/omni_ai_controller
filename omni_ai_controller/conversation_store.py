@@ -65,7 +65,8 @@ class ConversationStore:
         return """
             SELECT conversation.id::text AS id,
                    conversation.scope_type,
-                   conversation.owner_account_id::text AS owner_account_id,
+                         conversation.owner_account_id::text AS owner_account_id,
+                         conversation.owner_admin_id::text AS owner_admin_id,
                    conversation.title,
                    conversation.model_name,
                    conversation.enable_thinking,
@@ -83,18 +84,24 @@ class ConversationStore:
             LEFT JOIN ai_messages message ON message.conversation_id = conversation.id
             WHERE conversation.id = %s
               AND conversation.scope_type = 'dashboard'
+              AND conversation.owner_admin_id = %s
               AND conversation.deleted_at IS NULL
             GROUP BY conversation.id
         """
 
-    def _get_conversation(self, cursor: psycopg.Cursor[Any], conversation_id: UUID) -> dict[str, Any]:
-        cursor.execute(self._conversation_query(), (conversation_id,))
+    def _get_conversation(
+        self,
+        cursor: psycopg.Cursor[Any],
+        conversation_id: UUID,
+        owner_admin_id: str,
+    ) -> dict[str, Any]:
+        cursor.execute(self._conversation_query(), (conversation_id, owner_admin_id))
         row = cursor.fetchone()
         if row is None:
             raise ConversationNotFoundError("对话不存在")
         return dict(row)
 
-    def list_conversations(self) -> list[dict[str, Any]]:
+    def list_conversations(self, owner_admin_id: str) -> list[dict[str, Any]]:
         try:
             with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
@@ -102,6 +109,7 @@ class ConversationStore:
                     SELECT conversation.id::text AS id,
                            conversation.scope_type,
                            conversation.owner_account_id::text AS owner_account_id,
+                           conversation.owner_admin_id::text AS owner_admin_id,
                            conversation.title,
                            conversation.model_name,
                            conversation.enable_thinking,
@@ -115,13 +123,15 @@ class ConversationStore:
                                ORDER BY latest.sequence_number DESC
                                LIMIT 1
                            ), '') AS last_message
-                    FROM ai_conversations conversation
-                    LEFT JOIN ai_messages message ON message.conversation_id = conversation.id
-                    WHERE conversation.scope_type = 'dashboard'
+                                        FROM ai_conversations conversation
+                                        LEFT JOIN ai_messages message ON message.conversation_id = conversation.id
+                                        WHERE conversation.scope_type = 'dashboard'
+                                            AND conversation.owner_admin_id = %s
                       AND conversation.deleted_at IS NULL
                     GROUP BY conversation.id
                     ORDER BY conversation.updated_at DESC, conversation.created_at DESC
-                    """
+                    """,
+                    (owner_admin_id,),
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except ConversationStoreError:
@@ -132,6 +142,7 @@ class ConversationStore:
     def create_conversation(
         self,
         *,
+        owner_admin_id: str,
         title: str,
         model_name: str | None,
         enable_thinking: bool,
@@ -141,22 +152,28 @@ class ConversationStore:
                 cursor.execute(
                     """
                     INSERT INTO ai_conversations (
-                        scope_type, title, model_name, enable_thinking
+                        scope_type, owner_admin_id, title, model_name, enable_thinking
                     )
-                    VALUES ('dashboard', %s, %s, %s)
+                    VALUES ('dashboard', %s, %s, %s, %s)
                     RETURNING id
                     """,
-                    (title, model_name, enable_thinking),
+                    (owner_admin_id, title, model_name, enable_thinking),
                 )
-                return self._get_conversation(cursor, cursor.fetchone()["id"])
+                return self._get_conversation(
+                    cursor, cursor.fetchone()["id"], owner_admin_id
+                )
         except psycopg.Error as exc:
             raise ConversationStoreError("无法创建对话") from exc
 
-    def get_conversation(self, conversation_id: str) -> dict[str, Any]:
+    def get_conversation(
+        self, conversation_id: str, owner_admin_id: str
+    ) -> dict[str, Any]:
         normalized_id = self._normalize_id(conversation_id)
         try:
             with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:
-                conversation = self._get_conversation(cursor, normalized_id)
+                conversation = self._get_conversation(
+                    cursor, normalized_id, owner_admin_id
+                )
                 cursor.execute(
                     """
                     SELECT id::text AS id, sequence_number, role, content,
@@ -175,7 +192,9 @@ class ConversationStore:
         except psycopg.Error as exc:
             raise ConversationStoreError("无法读取对话") from exc
 
-    def rename_conversation(self, conversation_id: str, title: str) -> dict[str, Any]:
+    def rename_conversation(
+        self, conversation_id: str, title: str, owner_admin_id: str
+    ) -> dict[str, Any]:
         normalized_id = self._normalize_id(conversation_id)
         try:
             with self._connect() as connection, connection.cursor(row_factory=dict_row) as cursor:
@@ -185,20 +204,21 @@ class ConversationStore:
                     SET title = %s, updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s
                       AND scope_type = 'dashboard'
+                      AND owner_admin_id = %s
                       AND deleted_at IS NULL
                     RETURNING id
                     """,
-                    (title, normalized_id),
+                    (title, normalized_id, owner_admin_id),
                 )
                 if cursor.fetchone() is None:
                     raise ConversationNotFoundError("对话不存在")
-                return self._get_conversation(cursor, normalized_id)
+                return self._get_conversation(cursor, normalized_id, owner_admin_id)
         except ConversationNotFoundError:
             raise
         except psycopg.Error as exc:
             raise ConversationStoreError("无法重命名对话") from exc
 
-    def delete_conversation(self, conversation_id: str) -> None:
+    def delete_conversation(self, conversation_id: str, owner_admin_id: str) -> None:
         normalized_id = self._normalize_id(conversation_id)
         try:
             with self._connect() as connection, connection.cursor() as cursor:
@@ -208,9 +228,10 @@ class ConversationStore:
                     SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s
                       AND scope_type = 'dashboard'
+                      AND owner_admin_id = %s
                       AND deleted_at IS NULL
                     """,
-                    (normalized_id,),
+                    (normalized_id, owner_admin_id),
                 )
                 if cursor.rowcount != 1:
                     raise ConversationNotFoundError("对话不存在")
@@ -223,6 +244,7 @@ class ConversationStore:
         self,
         conversation_id: str,
         *,
+        owner_admin_id: str,
         content: str,
         model_name: str | None,
         enable_thinking: bool,
@@ -236,10 +258,11 @@ class ConversationStore:
                     FROM ai_conversations
                     WHERE id = %s
                       AND scope_type = 'dashboard'
+                      AND owner_admin_id = %s
                       AND deleted_at IS NULL
                     FOR UPDATE
                     """,
-                    (normalized_id,),
+                    (normalized_id, owner_admin_id),
                 )
                 current = cursor.fetchone()
                 if current is None:
@@ -304,7 +327,9 @@ class ConversationStore:
                     {"role": row["role"], "content": row["content"]}
                     for row in cursor.fetchall()
                 ]
-                conversation = self._get_conversation(cursor, normalized_id)
+                conversation = self._get_conversation(
+                    cursor, normalized_id, owner_admin_id
+                )
                 return conversation, user_message, context
         except ConversationNotFoundError:
             raise
@@ -315,6 +340,7 @@ class ConversationStore:
         self,
         conversation_id: str,
         *,
+        owner_admin_id: str,
         content: str,
         reasoning_content: str,
         model_name: str | None,
@@ -329,10 +355,11 @@ class ConversationStore:
                     FROM ai_conversations
                     WHERE id = %s
                       AND scope_type = 'dashboard'
+                      AND owner_admin_id = %s
                       AND deleted_at IS NULL
                     FOR UPDATE
                     """,
-                    (normalized_id,),
+                    (normalized_id, owner_admin_id),
                 )
                 if cursor.fetchone() is None:
                     raise ConversationNotFoundError("对话不存在")
@@ -372,7 +399,10 @@ class ConversationStore:
                     """,
                     (model_name, normalized_id),
                 )
-                return self._get_conversation(cursor, normalized_id), assistant_message
+                return (
+                    self._get_conversation(cursor, normalized_id, owner_admin_id),
+                    assistant_message,
+                )
         except ConversationNotFoundError:
             raise
         except psycopg.Error as exc:
