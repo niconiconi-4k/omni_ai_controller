@@ -56,34 +56,22 @@ class ServerConfig:
     model_name: str
 
     @classmethod
-    def from_model_dir(
-        cls,
-        model_dir: Path | str,
-        secrets_file: Path | str | None = None,
-    ) -> "ServerConfig":
+    def from_model_dir(cls, model_dir: Path | str) -> "ServerConfig":
         resolved = validate_model_dir(Path(model_dir))
         values = read_env(resolved / ".env")
-        protected_path = Path(
-            secrets_file
-            or os.getenv(
-                "OMNI_MODEL_SECRETS_FILE",
-                "/var/lib/omni-ai/config/model-secrets.env",
-            )
-        )
-        secrets = read_env(protected_path)
         port = values.get("API_PORT", "8000")
         return cls(
             model_dir=resolved,
             base_url=f"http://127.0.0.1:{port}",
-            api_key=secrets.get("OPENAI_API_KEY", ""),
-            control_token=secrets.get("CONTROL_TOKEN", ""),
+            api_key=values.get("OPENAI_API_KEY", ""),
+            control_token=values.get("CONTROL_TOKEN", ""),
             model_name=values.get("SERVED_MODEL_NAME", "qwen3.8-27b-instruct"),
         )
 
     def require_credentials(self) -> None:
         if not self.api_key or not self.control_token:
             raise ConfigurationError(
-                "受保护的模型密钥文件不存在或缺少访问密钥，请先运行模型部署脚本。"
+                "模型目录中没有可用的 .env 或访问密钥，请先启动容器以生成配置。"
             )
 
 

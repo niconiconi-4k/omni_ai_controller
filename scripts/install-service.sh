@@ -44,7 +44,6 @@ OMNI_CONTROLLER_SOCKET=/run/omni-ai-controller/controller.sock
 OMNI_CONVERSATION_DATABASE_HOST=127.0.0.1
 OMNI_CONVERSATION_DATABASE_PORT=15432
 OMNI_OPENAI_VISION_CONFIG=/etc/omni-ai-controller/openai-vision.json
-OMNI_MODEL_SECRETS_FILE=/var/lib/omni-ai/config/model-secrets.env
 EOF
 fi
 if grep -q '^OMNI_ALLOWED_CONTAINERS=' "${config_file}" && \
@@ -63,9 +62,6 @@ if ! grep -q '^OMNI_CONVERSATION_DATABASE_PORT=' "${config_file}"; then
 fi
 if ! grep -q '^OMNI_OPENAI_VISION_CONFIG=' "${config_file}"; then
   printf 'OMNI_OPENAI_VISION_CONFIG=/etc/omni-ai-controller/openai-vision.json\n' >>"${config_file}"
-fi
-if ! grep -q '^OMNI_MODEL_SECRETS_FILE=' "${config_file}"; then
-  printf 'OMNI_MODEL_SECRETS_FILE=/var/lib/omni-ai/config/model-secrets.env\n' >>"${config_file}"
 fi
 chmod 0600 "${config_file}"
 install -d -m 0755 /run/omni-ai-controller
