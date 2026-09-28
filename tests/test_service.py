@@ -77,6 +77,43 @@ class FakeController:
 
     def chat_json(self, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.chat_messages = messages
+        if kwargs.get("schema_name") == "li_shifu_audit_plan":
+            payload = {
+                "objective": "按会计种子流程核对",
+                "strategy_order": ["direct_expenses", "anomaly_review"],
+                "tasks": [{
+                    "task_id": "task-1", "strategy": "direct_expenses",
+                    "objective": "核对支出", "priority": 100,
+                    "evidence_requirements": ["金额", "日期"],
+                }],
+                "deviations": [], "risk_focus": [],
+            }
+            return SimpleNamespace(
+                content=json.dumps(payload), reasoning_content="",
+                raw={"id": "li-plan-1", "usage": {"total_tokens": 100}},
+            )
+        if kwargs.get("schema_name") == "ma_shifu_evidence_review":
+            payload = {
+                "task_results": [{
+                    "task_id": "task-1", "status": "completed",
+                    "finding": "完成", "evidence": [], "unresolved": [],
+                }],
+                "decisions": [], "summary": "马师傅完成核对", "risks": [],
+                "cache_notes": [],
+            }
+            return SimpleNamespace(
+                content=json.dumps(payload), reasoning_content="",
+                raw={"id": "ma-review-1", "usage": {"total_tokens": 200}},
+            )
+        if kwargs.get("schema_name") == "li_shifu_final_assessment":
+            payload = {
+                "decisions": [], "summary": "李师傅完成评估", "risks": [],
+                "plan_assessment": "种子流程适用", "skill_candidates": [],
+            }
+            return SimpleNamespace(
+                content=json.dumps(payload), reasoning_content="",
+                raw={"id": "li-final-1", "usage": {"total_tokens": 100}},
+            )
         if kwargs.get("schema_name") == "local_audit_reconciliation":
             return SimpleNamespace(
                 content=json.dumps({
@@ -544,6 +581,33 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert audited.status_code == 200, audited.text
         assert audited.json()["serialized"] is True
         assert audited.json()["result"]["decisions"][0]["kind"] == "employee_reimbursement"
+
+        rejected_agentic = test_client.post(
+            "/internal/audit/agentic",
+            json={"audit_id": "audit-1", "context": {}},
+        )
+        assert rejected_agentic.status_code == 401
+        agentic = test_client.post(
+            "/internal/audit/agentic",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "audit_id": "audit-1",
+                "context": {
+                    "transactions": [{"id": "tx-1"}],
+                    "receipts": [{"id": "receipt-1"}],
+                    "deterministic_candidates": [{
+                        "transaction_id": "tx-1",
+                        "receipt_upload_id": "receipt-1",
+                        "allocation_role": "direct_expense",
+                    }],
+                },
+            },
+        )
+        assert agentic.status_code == 200, agentic.text
+        assert agentic.json()["process_mode"] == "agentic"
+        assert [step["agent_kind"] for step in agentic.json()["steps"]] == [
+            "audit_planner", "evidence_worker", "audit_planner",
+        ]
 
 
 def test_internal_vision_rejects_document_total_before_forwarding(monkeypatch) -> None:

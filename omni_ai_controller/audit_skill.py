@@ -11,54 +11,58 @@ from .config import ConfigurationError
 AUDIT_SKILL_LOCK = threading.Lock()
 MAX_AUDIT_CONTEXT_CHARS = 60_000
 
+AUDIT_DECISION_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "transaction_id": {"type": "string"},
+        "receipt_upload_ids": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {"type": "string"},
+        },
+        "kind": {
+            "type": "string",
+            "enum": [
+                "revenue_settlement",
+                "employee_reimbursement",
+                "direct_match",
+                "anomaly",
+                "unresolved",
+            ],
+        },
+        "recommendation": {
+            "type": "string",
+            "enum": ["match", "suggest", "leave_unmatched"],
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "explanation": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "discrepancy_note": {"type": "string"},
+    },
+    "required": [
+        "transaction_id",
+        "receipt_upload_ids",
+        "kind",
+        "recommendation",
+        "confidence",
+        "explanation",
+        "evidence",
+        "discrepancy_note",
+    ],
+}
+
+AUDIT_DECISIONS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "maxItems": 200,
+    "items": AUDIT_DECISION_ITEM_SCHEMA,
+}
+
 AUDIT_SKILL_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "decisions": {
-            "type": "array",
-            "maxItems": 200,
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "transaction_id": {"type": "string"},
-                    "receipt_upload_ids": {
-                        "type": "array",
-                        "maxItems": 12,
-                        "items": {"type": "string"},
-                    },
-                    "kind": {
-                        "type": "string",
-                        "enum": [
-                            "revenue_settlement",
-                            "employee_reimbursement",
-                            "direct_match",
-                            "anomaly",
-                            "unresolved",
-                        ],
-                    },
-                    "recommendation": {
-                        "type": "string",
-                        "enum": ["match", "suggest", "leave_unmatched"],
-                    },
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "explanation": {"type": "string"},
-                    "evidence": {"type": "array", "items": {"type": "string"}},
-                    "discrepancy_note": {"type": "string"},
-                },
-                "required": [
-                    "transaction_id",
-                    "receipt_upload_ids",
-                    "kind",
-                    "recommendation",
-                    "confidence",
-                    "explanation",
-                    "evidence",
-                    "discrepancy_note",
-                ],
-            },
-        },
+        "decisions": AUDIT_DECISIONS_SCHEMA,
         "summary": {"type": "string"},
         "risks": {"type": "array", "items": {"type": "string"}},
     },
