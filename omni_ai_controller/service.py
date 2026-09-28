@@ -224,6 +224,7 @@ class VisionAnalyzeRequest(BaseModel):
     document_text: str | None = Field(default=None, max_length=100_000)
     model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] | None = None
     classify: bool = True
+    subject_company_name: str | None = Field(default=None, max_length=255)
 
 
 class StatementPageRequest(BaseModel):
@@ -243,6 +244,7 @@ class BankStatementAnalyzeRequest(BaseModel):
 class VoucherClassificationRequest(BaseModel):
     text: str = Field(default="", max_length=100_000)
     financial_facts: dict[str, object] = Field(default_factory=dict)
+    subject_company_name: str | None = Field(default=None, max_length=255)
 
 
 class AuditReconciliationRequest(BaseModel):
@@ -752,6 +754,7 @@ def create_app(
                     document_text=payload.document_text,
                     model_override=payload.model,
                     classify=payload.classify,
+                    subject_company_name=payload.subject_company_name,
                 )
             image, filename, content_type, _ = decoded_pages[0]
             return active_vision_client.recognize(
@@ -760,6 +763,7 @@ def create_app(
                 content_type=content_type,
                 model_override=payload.model,
                 classify=payload.classify,
+                subject_company_name=payload.subject_company_name,
             )
         except VisionRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -820,6 +824,7 @@ def create_app(
                 active_controller.model_server.client,
                 text=payload.text,
                 financial_facts=payload.financial_facts,
+                subject_company_name=payload.subject_company_name,
             )
         except VoucherClassificationError as exc:
             raise HTTPException(

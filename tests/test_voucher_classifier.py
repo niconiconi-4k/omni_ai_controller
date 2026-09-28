@@ -36,14 +36,23 @@ def test_classify_voucher_returns_allowlisted_result() -> None:
 
     result = classify_voucher(
         client,  # type: ignore[arg-type]
-        text="Invoice 100 SEK",
-        financial_facts={"amount_decimal": "100.00"},
+        text="Leverantör: Seller AB\nFakturamottagare: Buyer AB\nInvoice 100 SEK",
+        financial_facts={
+            "amount_decimal": "100.00",
+            "payer": {"name": "Buyer AB"},
+            "payee": {"name": "Seller AB"},
+        },
+        subject_company_name="Buyer AB",
     )
 
     assert result["classification"]["document_type"] == "expense_voucher"
     assert result["model"] == "qwen3.8-27b-instruct"
     assert result["usage"]["total_tokens"] == 42
     assert "未经信任" in client.messages[0]["content"]
+    assert "必须先判断交易方向" in client.messages[0]["content"]
+    assert "Kreditfaktura/Kreditnota 是单据类型，不代表收入" in client.messages[0]["content"]
+    assert "不得因为出现 faktura 或 kreditfaktura 就默认收入" in client.messages[0]["content"]
+    assert '"subject_company_name":"Buyer AB"' in client.messages[1]["content"]
     assert "bank_voucher" not in client.schema["properties"]["document_type"]["enum"]
 
 
@@ -53,4 +62,5 @@ def test_classify_voucher_rejects_invalid_json() -> None:
             FakeClient("not-json"),  # type: ignore[arg-type]
             text="Invoice",
             financial_facts={},
+            subject_company_name="Buyer AB",
         )

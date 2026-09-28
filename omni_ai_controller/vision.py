@@ -39,6 +39,29 @@ RECEIPT_DOCUMENT_TYPES = (
     "loan_interest_voucher",
     "tax_voucher",
 )
+VOUCHER_CLASSIFICATION_INSTRUCTION = (
+    "Classify into exactly one of five voucher categories only when both the document type and "
+    "transaction direction are supported by strong evidence. income_voucher means income from goods "
+    "or services sold by the subject company. expense_voucher means goods, services, or operating "
+    "expenses purchased by or charged to the subject company. payroll_voucher means salary, payroll, "
+    "or employer payroll declarations. loan_interest_voucher means loans, interest, financing, or "
+    "other primary banking business, excluding bank transaction statements. tax_voucher means VAT, "
+    "tax returns, customs, or import/export tax documents. For faktura, kreditfaktura, kreditnota, "
+    "räkning, and betalningsavi, determine transaction direction before document type. An invoice is "
+    "not inherently income. A charge from the subject company to a customer is income; a charge from "
+    "a supplier or another company to the subject company is expense. A Kreditfaktura/Kreditnota from "
+    "the subject company to its customer reduces sales and remains income_voucher; one from a supplier "
+    "to the subject company reduces purchases and remains expense_voucher. Treat kundfaktura, a sales "
+    "invoice or sales receipt issued by the subject company, and POS/Z-rapport as income evidence. Treat "
+    "leverantörsfaktura, purchase receipts, räkning, betalningsavi, utilities, rent, phone, and software "
+    "bills charged by suppliers as expense evidence. Use Säljare, Köpare, Kund, Leverantör, "
+    "Fakturamottagare, company names, organization numbers, payment details, payer/payee facts, and body "
+    "text to establish direction. Never classify from a keyword alone and never assume the subject "
+    "company is the seller when identity or direction is insufficient. Never return bank_voucher or "
+    "uncategorized. Set classification.is_certain=true only when direction and category are unambiguous "
+    "and confidence is at least 0.85; otherwise return document_type=null and "
+    "status=needs_manual_confirmation."
+)
 
 
 class VisionSettingsError(RuntimeError):
@@ -168,12 +191,14 @@ class OpenAIVisionClient:
         content_type: str,
         model_override: str | None = None,
         classify: bool = True,
+        subject_company_name: str | None = None,
     ) -> dict[str, Any]:
         return self.recognize_document(
             [(image, filename, content_type, 1)],
             document_text=None,
             model_override=model_override,
             classify=classify,
+            subject_company_name=subject_company_name,
         )
 
     def recognize_document(
@@ -183,6 +208,7 @@ class OpenAIVisionClient:
         document_text: str | None,
         model_override: str | None = None,
         classify: bool = True,
+        subject_company_name: str | None = None,
     ) -> dict[str, Any]:
         if not pages:
             raise VisionRequestError("文档不包含可识别页面", status_code=400)
@@ -208,14 +234,7 @@ class OpenAIVisionClient:
         if model not in SUPPORTED_VISION_MODELS:
             raise VisionRequestError("不支持该 OpenAI 识图模型", status_code=422)
         classification_instruction = (
-            "Classify only when the visual evidence is strong: income_voucher = sales invoice, "
-            "POS/Z report, or credit invoice/Kreditfaktura; expense_voucher = supplier invoice, "
-            "purchase receipt, or travel reimbursement; payroll_voucher = payslip or employer "
-            "declaration; loan_interest_voucher = bank loan, repayment, interest, or bank-fee "
-            "document; tax_voucher = VAT return, tax, customs, import, or export document. Never "
-            "return bank_voucher or uncategorized. Set classification.is_certain=true only when "
-            "one category is unambiguous and confidence is at least 0.85; otherwise return "
-            "document_type=null and status=needs_manual_confirmation."
+            VOUCHER_CLASSIFICATION_INSTRUCTION
             if classify
             else "Do not classify this document. Set classification.document_type=null, "
             "classification.is_certain=false, classification.confidence=0, explain that local "
@@ -233,6 +252,9 @@ class OpenAIVisionClient:
                     "payable amount, ISO currency when visible, reference/OCR/payment identifiers, account "
                     "or card numbers, transaction time, and payer/payee company names and organization/tax "
                     "numbers. "
+                    "The service-side subject company name is "
+                    + json.dumps((subject_company_name or "").strip()[:255], ensure_ascii=False)
+                    + ". Treat it as identity context only when it is specific and visibly matches the document. "
                     + classification_instruction
                     + " Use needs_reupload only when page quality prevents reliable reading. Return only "
                     "data matching the supplied JSON schema."

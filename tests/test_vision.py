@@ -126,6 +126,7 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
             b"image-bytes",
             filename="receipt.png",
             content_type="image/png",
+            subject_company_name="Buyer AB",
         )
 
     assert result["request_id"] == "request-1"
@@ -144,6 +145,11 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
     assert "financial_facts" in schema["properties"]
     assert "classification" in schema["properties"]
     assert "bank_voucher" not in schema["properties"]["classification"]["properties"]["document_type"]["enum"]
+    instruction = sent_payload["messages"][0]["content"][0]["text"]
+    assert 'subject company name is "Buyer AB"' in instruction
+    assert "determine transaction direction before document type" in instruction
+    assert "An invoice is not inherently income" in instruction
+    assert "Kreditfaktura/Kreditnota" in instruction
 
 
 def test_openai_vision_requires_configuration(tmp_path: Path) -> None:

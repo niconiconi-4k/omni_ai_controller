@@ -380,6 +380,7 @@ class FakeVisionClient:
         content_type: str,
         model_override: str | None = None,
         classify: bool = True,
+        subject_company_name: str | None = None,
     ) -> dict[str, object]:
         return {
             "request_id": "vision-1",
@@ -388,6 +389,7 @@ class FakeVisionClient:
             "receipts": [{"index": 1, "text": filename, "payment_candidates": []}],
             "size": len(image),
             "content_type": content_type,
+            "subject_company_name": subject_company_name,
         }
 
     def recognize_document(
@@ -397,6 +399,7 @@ class FakeVisionClient:
         document_text: str | None,
         model_override: str | None = None,
         classify: bool = True,
+        subject_company_name: str | None = None,
     ) -> dict[str, object]:
         return {
             "request_id": "vision-document-1",
@@ -405,6 +408,7 @@ class FakeVisionClient:
             "receipts": [{"index": 1, "text": document_text or "", "payment_candidates": []}],
             "pages": [page_number for _, _, _, page_number in pages],
             "classify": classify,
+            "subject_company_name": subject_company_name,
         }
 
 
@@ -572,11 +576,13 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
                 "content_type": "image/png",
                 "image_base64": base64.b64encode(b"image").decode("ascii"),
                 "model": "gpt-6-sol",
+                "subject_company_name": "Buyer AB",
             },
         )
         assert analyzed.status_code == 200
         assert analyzed.json()["request_id"] == "vision-1"
         assert analyzed.json()["model"]["vision"] == "gpt-6-sol"
+        assert analyzed.json()["subject_company_name"] == "Buyer AB"
 
         analyzed_pdf = test_client.post(
             "/internal/vision/receipts",
@@ -599,12 +605,14 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
                 "document_text": "=== PDF PAGE 1/2 ===\nInvoice",
                 "model": "gpt-6-sol",
                 "classify": False,
+                "subject_company_name": "Buyer AB",
             },
         )
         assert analyzed_pdf.status_code == 200
         assert analyzed_pdf.json()["request_id"] == "vision-document-1"
         assert analyzed_pdf.json()["pages"] == [1, 2]
         assert analyzed_pdf.json()["classify"] is False
+        assert analyzed_pdf.json()["subject_company_name"] == "Buyer AB"
 
         invalid_pdf = test_client.post(
             "/internal/vision/receipts",
@@ -631,6 +639,7 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
             json={
                 "text": "Invoice 88,00 SEK",
                 "financial_facts": {"amount_decimal": "88.00", "currency": "SEK"},
+                "subject_company_name": "Buyer AB",
             },
         )
         assert classified.status_code == 200, classified.text
