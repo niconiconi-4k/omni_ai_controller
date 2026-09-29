@@ -624,6 +624,24 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert analyzed_pdf.json()["classify"] is False
         assert analyzed_pdf.json()["subject_company_name"] == "Buyer AB"
 
+        analyzed_sparse_pdf = test_client.post(
+            "/internal/vision/receipts",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "pages": [{
+                    "page_number": 2,
+                    "filename": "page-002.jpg",
+                    "content_type": "image/jpeg",
+                    "image_base64": base64.b64encode(b"page-two").decode("ascii"),
+                }],
+                "page_count": 3,
+                "document_text": "=== PDF PAGE 1/3 ===\nNative text",
+            },
+        )
+        assert analyzed_sparse_pdf.status_code == 200
+        assert analyzed_sparse_pdf.json()["pages"] == [2]
+        assert analyzed_sparse_pdf.json()["page_count"] == 3
+
         analyzed_text_pdf = test_client.post(
             "/internal/vision/receipts",
             headers={"X-Vision-Token": "internal-vision-token"},

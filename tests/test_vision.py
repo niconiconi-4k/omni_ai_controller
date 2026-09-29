@@ -149,12 +149,21 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
     assert "receipts" in schema["properties"]
     receipt_schema = schema["properties"]["receipts"]["items"]
     assert receipt_schema["properties"]["relevance"]["enum"] == ["unassessed"]
+    facts_schema = receipt_schema["properties"]["financial_facts"]
+    assert facts_schema["properties"]["amount_effect"]["enum"] == [
+        "normal", "reversal", "unknown",
+    ]
+    assert "amount_effect" in facts_schema["required"]
     assert "bank_voucher" not in schema["properties"]["classification"]["properties"]["document_type"]["enum"]
     instruction = sent_payload["messages"][0]["content"][0]["text"]
     assert 'subject company name is "Buyer AB"' in instruction
     assert "determine transaction direction before document type" in instruction
     assert "An invoice is not inherently income" in instruction
     assert "Kreditfaktura/Kreditnota" in instruction
+    assert "intrinsic accounting role" in instruction
+    assert "ownership is unverified" in instruction
+    assert "must be negative for a reversal" in instruction
+    assert "Do not negate an ordinary document merely because it is classified as an expense" in instruction
     assert 'audit period is "2026-09-01" through "2026-09-30"' not in instruction
     assert "Do not decide audit-period" in instruction
     assert "Do not transcribe advertisements" in instruction

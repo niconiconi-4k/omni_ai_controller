@@ -40,8 +40,10 @@ RECEIPT_DOCUMENT_TYPES = (
     "tax_voucher",
 )
 VOUCHER_CLASSIFICATION_INSTRUCTION = (
-    "Classify into exactly one of five voucher categories only when both the document type and "
-    "transaction direction are supported by strong evidence. income_voucher means income from goods "
+    "Classify the document's intrinsic accounting role into exactly one of five voucher categories. "
+    "This does not decide company ownership, audit relevance, or admissibility; those decisions belong "
+    "to the later audit stage. Do not lower classification confidence solely because the subject company "
+    "name is absent when the document itself clearly establishes its economic role. income_voucher means income from goods "
     "or services sold by the subject company. expense_voucher means goods, services, or operating "
     "expenses purchased by or charged to the subject company. payroll_voucher means salary, payroll, "
     "or employer payroll declarations. loan_interest_voucher means loans, interest, financing, or "
@@ -56,8 +58,9 @@ VOUCHER_CLASSIFICATION_INSTRUCTION = (
     "leverantörsfaktura, purchase receipts, räkning, betalningsavi, utilities, rent, phone, and software "
     "bills charged by suppliers as expense evidence. Use Säljare, Köpare, Kund, Leverantör, "
     "Fakturamottagare, company names, organization numbers, payment details, payer/payee facts, and body "
-    "text to establish direction. Never classify from a keyword alone and never assume the subject "
-    "company is the seller when identity or direction is insufficient. Never return bank_voucher or "
+    "text to establish direction. Never classify from a keyword alone and never invent a subject-company "
+    "relationship that is not visible. Return null only when the document's intrinsic type or economic "
+    "direction is ambiguous, not merely because ownership is unverified. Never return bank_voucher or "
     "uncategorized. Set classification.is_certain=true only when direction and category are unambiguous "
     "and confidence is at least 0.85; otherwise return document_type=null and "
     "status=needs_manual_confirmation."
@@ -92,6 +95,10 @@ FINANCIAL_FACTS_SCHEMA: dict[str, Any] = {
     "properties": {
         "amount_text": {"type": ["string", "null"]},
         "amount_decimal": {"type": ["string", "null"]},
+        "amount_effect": {
+            "type": "string",
+            "enum": ["normal", "reversal", "unknown"],
+        },
         "currency": {"type": ["string", "null"]},
         "reference_numbers": {"type": "array", "items": {"type": "string"}},
         "account_numbers": {"type": "array", "items": {"type": "string"}},
@@ -101,7 +108,7 @@ FINANCIAL_FACTS_SCHEMA: dict[str, Any] = {
         "payee": PARTY_SCHEMA,
     },
     "required": [
-        "amount_text", "amount_decimal", "currency", "reference_numbers",
+        "amount_text", "amount_decimal", "amount_effect", "currency", "reference_numbers",
         "account_numbers", "transaction_time_text", "transaction_time_iso",
         "payer", "payee",
     ],
@@ -307,13 +314,13 @@ class OpenAIVisionClient:
         audit_period_start: str | None = None,
         audit_period_end: str | None = None,
     ) -> dict[str, Any]:
-        page_count = page_count_override or len(pages)
+        page_count = page_count_override or max((page[3] for page in pages), default=0)
         if page_count < 1 or page_count > 12:
             raise VisionRequestError("文档页数必须介于 1 到 12 页", status_code=400)
         if not pages and not (document_text or "").strip():
             raise VisionRequestError("文档不包含可识别文字或页面", status_code=400)
-        if pages and page_count_override is not None and page_count_override != len(pages):
-            raise VisionRequestError("渲染页面数量与文档页数不一致", status_code=400)
+        if any(page[3] > page_count for page in pages):
+            raise VisionRequestError("渲染页面页码超过文档总页数", status_code=400)
         if len(pages) > 12:
             raise VisionRequestError("文档最多支持 12 页", status_code=413)
         total_bytes = 0
@@ -358,7 +365,13 @@ class OpenAIVisionClient:
                     "characters: issuer and recipient, document/invoice/reference number, document date, "
                     "due date, final paid or payable total, currency, payment account/OCR/reference, and any "
                     "line necessary to justify classification. Financial facts must contain that receipt's "
-                    "final payable or paid amount whenever it is visible. For payroll documents, use the net "
+                    "final payable or paid amount whenever it is visible. Set financial_facts.amount_effect="
+                    "reversal for refunds, credit notes, returned purchases, voids, and other reversals; set it "
+                    "to normal for ordinary non-reversing documents, or unknown only when the effect is unclear. "
+                    "amount_decimal is the signed canonical amount: it and any final-total payment candidate must "
+                    "be negative for a reversal and non-negative for a normal document, even when a reversal's "
+                    "printed total omits a minus sign. Preserve any visible sign in amount_text. Do not negate an "
+                    "ordinary document merely because it is classified as an expense. For payroll documents, use the net "
                     "final payment labelled Nettolön, Netto lön, Att utbetala, Utbetalas, Utbetalt, or the "
                     "equivalent—not Bruttolön or Månadslön—and include at most three amount candidates per "
                     "receipt. Set relevance=unassessed and "
@@ -412,7 +425,7 @@ class OpenAIVisionClient:
                 [
                     {
                         "type": "text",
-                        "text": f"Rendered page {page_number}/{len(pages)} ({filename}).",
+                        "text": f"Rendered page {page_number}/{page_count} ({filename}).",
                     },
                     {
                         "type": "image_url",

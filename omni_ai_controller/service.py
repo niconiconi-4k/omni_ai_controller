@@ -736,8 +736,18 @@ def create_app(
                     (image, Path(page.filename).name, page.content_type, page.page_number)
                 )
             decoded_pages.sort(key=lambda item: item[3])
-            if [page[3] for page in decoded_pages] != list(range(1, len(decoded_pages) + 1)):
-                raise HTTPException(status_code=422, detail="PDF page numbers must be continuous from 1")
+            page_numbers = [page[3] for page in decoded_pages]
+            if payload.page_count is None:
+                if page_numbers != list(range(1, len(decoded_pages) + 1)):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Sparse PDF pages require the document page_count",
+                    )
+            elif max(page_numbers) > payload.page_count:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Vision page number exceeds the document page_count",
+                )
         elif legacy_supplied:
             if not payload.filename or not payload.content_type or not payload.image_base64:
                 raise HTTPException(status_code=422, detail="Single-image request is incomplete")

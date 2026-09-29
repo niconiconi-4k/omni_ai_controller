@@ -52,6 +52,8 @@ def test_classify_voucher_returns_allowlisted_result() -> None:
     assert "必须先判断交易方向" in client.messages[0]["content"]
     assert "Kreditfaktura/Kreditnota 是单据类型，不代表收入" in client.messages[0]["content"]
     assert "不得因为出现 faktura 或 kreditfaktura 就默认收入" in client.messages[0]["content"]
+    assert "只判断凭证自身的会计角色" in client.messages[0]["content"]
+    assert "归属与相关性由后续审计阶段独立判断" in client.messages[0]["content"]
     assert '"subject_company_name":"Buyer AB"' in client.messages[1]["content"]
     assert "bank_voucher" not in client.schema["properties"]["document_type"]["enum"]
 
