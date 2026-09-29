@@ -300,14 +300,20 @@ class OpenAIVisionClient:
         pages: list[tuple[bytes, str, str, int]],
         *,
         document_text: str | None,
+        page_count_override: int | None = None,
         model_override: str | None = None,
         classify: bool = True,
         subject_company_name: str | None = None,
         audit_period_start: str | None = None,
         audit_period_end: str | None = None,
     ) -> dict[str, Any]:
-        if not pages:
-            raise VisionRequestError("文档不包含可识别页面", status_code=400)
+        page_count = page_count_override or len(pages)
+        if page_count < 1 or page_count > 12:
+            raise VisionRequestError("文档页数必须介于 1 到 12 页", status_code=400)
+        if not pages and not (document_text or "").strip():
+            raise VisionRequestError("文档不包含可识别文字或页面", status_code=400)
+        if pages and page_count_override is not None and page_count_override != len(pages):
+            raise VisionRequestError("渲染页面数量与文档页数不一致", status_code=400)
         if len(pages) > 12:
             raise VisionRequestError("文档最多支持 12 页", status_code=413)
         total_bytes = 0
@@ -341,7 +347,7 @@ class OpenAIVisionClient:
             {
                 "type": "text",
                 "text": (
-                    "Analyze the ordered pages as a document package that may contain multiple distinct "
+                    "Analyze the ordered PDF page content as a document package that may contain multiple distinct "
                     "invoices, receipts, credit notes, reminders, or unrelated historical documents. Split "
                     "every distinct financial document into one receipts item and give its inclusive page "
                     "range. Do not treat advertisements, generic terms, legal boilerplate, navigation, "
@@ -349,9 +355,19 @@ class OpenAIVisionClient:
                     "For each receipt, output only a compact audit-relevant excerpt (normally at most 1200 "
                     "characters): issuer and recipient, document/invoice/reference number, document date, "
                     "due date, final paid or payable total, currency, payment account/OCR/reference, and any "
-                    "line necessary to justify classification or relevance. Do not transcribe advertisements, "
-                    "terms, policies, explanatory prose, or full transaction tables. Inspect every rendered "
-                    "page even when the PDF text layer is long or omitted. Preserve visible masked account/card "
+                    "line necessary to justify classification or relevance. For an excluded receipt, stop after "
+                    "relevance is established: keep text under 240 characters, leave payment_candidates empty, "
+                    "set financial fact values to null with empty arrays, and return an uncertain null classification. "
+                    "Do not spend output tokens extracting or classifying content that has already been excluded. "
+                    "Do not transcribe advertisements, "
+                    "terms, policies, explanatory prose, or full transaction tables. "
+                    + (
+                        "The PDF text layer passed below has already passed local quality checks. Treat its page "
+                        "markers and text as the complete source; no rendered images are supplied or needed. "
+                        if not pages else
+                        "Inspect every supplied rendered page when the PDF text layer is incomplete or unreliable. "
+                    )
+                    + "Preserve visible masked account/card "
                     "characters exactly and never merge unrelated rows or amounts. "
                     "The service-side subject company name is "
                     + json.dumps((subject_company_name or "").strip()[:255], ensure_ascii=False)
@@ -368,7 +384,9 @@ class OpenAIVisionClient:
                     "or belongs to another company. Use needs_review when dates or ownership are ambiguous. If no "
                     "audit period is supplied, do not exclude a receipt merely because it is old. Select one "
                     "1-based primary_receipt_index from included receipts for the compatible top-level summary; if there is "
-                    "no clear primary receipt, return null and needs_manual_confirmation. Top-level text must be "
+                    "no clear primary receipt among otherwise applicable items, return null and "
+                    "needs_manual_confirmation. If every receipt is confidently excluded, return accepted with a null "
+                    "primary receipt because that is a complete successful result. Top-level text must be "
                     "a package summary under 500 characters and must not repeat receipt excerpts; top-level "
                     "financial_facts and classification must describe only the selected primary receipt. "
                     + classification_instruction
@@ -378,13 +396,19 @@ class OpenAIVisionClient:
             }
         ]
         if document_text:
+            layout_guidance = (
+                "Use rendered pages to resolve columns, tables and visual conflicts; "
+                if pages else
+                "No rendered pages are supplied because this text passed local quality checks; "
+            )
             user_content.append(
                 {
                     "type": "text",
                     "text": (
                         "This layout-preserving text came directly from the PDF text layer. Page markers "
-                        "and order are authoritative. Use rendered pages to resolve columns, tables and "
-                        "visual conflicts; do not flatten adjacent columns into one row:\n\n"
+                        "and order are authoritative. "
+                        + layout_guidance
+                        + "do not flatten adjacent columns into one row:\n\n"
                         + document_text[:100_000]
                     ),
                 }
@@ -525,7 +549,7 @@ class OpenAIVisionClient:
         if not isinstance(raw_receipts, list) or not raw_receipts:
             raw_receipts = [{
                 "page_start": 1,
-                "page_end": len(pages),
+                "page_end": page_count,
                 "relevance": "needs_review",
                 "relevance_reason": "模型未返回逐票据拆分结果",
                 "document_date_text": None,
@@ -542,8 +566,8 @@ class OpenAIVisionClient:
             if not isinstance(raw_receipt, dict):
                 continue
             try:
-                page_start = max(1, min(int(raw_receipt.get("page_start") or 1), len(pages)))
-                page_end = max(page_start, min(int(raw_receipt.get("page_end") or page_start), len(pages)))
+                page_start = max(1, min(int(raw_receipt.get("page_start") or 1), page_count))
+                page_end = max(page_start, min(int(raw_receipt.get("page_end") or page_start), page_count))
             except (TypeError, ValueError, OverflowError):
                 page_start = page_end = 1
             relevance = str(raw_receipt.get("relevance") or "needs_review")
@@ -585,7 +609,12 @@ class OpenAIVisionClient:
         status = str(result.get("status") or "needs_manual_confirmation")
         if status not in {"accepted", "needs_manual_confirmation", "needs_reupload"}:
             status = "needs_manual_confirmation"
-        if primary is None and status == "accepted":
+        all_receipts_excluded = bool(receipts) and all(
+            receipt["relevance"] == "excluded" for receipt in receipts
+        )
+        if all_receipts_excluded:
+            status = "accepted"
+        elif primary is None and status == "accepted":
             status = "needs_manual_confirmation"
         response_model = str(response_payload.get("model") or model)
         financial_facts = (
@@ -601,18 +630,21 @@ class OpenAIVisionClient:
         if not isinstance(classification, dict):
             classification = {}
         reasons = [str(value) for value in (result.get("reasons") or [])]
-        if primary is None and receipts:
+        if primary is None and receipts and not all_receipts_excluded:
             reasons.append("没有可自动纳入当前审计期间的主票据")
+        elif all_receipts_excluded:
+            reasons.append("所有票据均已明确排除，无需选择主票据")
         return {
             "request_id": str(response_payload.get("id") or "openai-vision"),
             "status": status,
             "reasons": reasons,
             "model": {"provider": "openai", "vision": response_model},
             "image": {
-                "filename": pages[0][1],
-                "content_type": pages[0][2],
+                "filename": pages[0][1] if pages else "pdf-text-layer",
+                "content_type": pages[0][2] if pages else "application/pdf",
                 "size_bytes": sum(len(page[0]) for page in pages),
-                "page_count": len(pages),
+                "page_count": page_count,
+                "recognition_mode": "rendered_pages" if pages else "text_layer",
             },
             "primary_receipt_index": primary.get("index") if primary else None,
             "receipts": receipts,

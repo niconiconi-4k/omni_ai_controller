@@ -221,6 +221,7 @@ class VisionAnalyzeRequest(BaseModel):
     content_type: Literal["image/jpeg", "image/png", "image/webp"] | None = None
     image_base64: str | None = Field(default=None, min_length=1, max_length=28_000_000)
     pages: list[VisionPageRequest] | None = Field(default=None, min_length=1, max_length=12)
+    page_count: int | None = Field(default=None, ge=1, le=12)
     document_text: str | None = Field(default=None, max_length=100_000)
     model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] | None = None
     classify: bool = True
@@ -694,10 +695,16 @@ def create_app(
             value is not None
             for value in (payload.filename, payload.content_type, payload.image_base64)
         )
-        if bool(payload.pages) == legacy_supplied:
+        text_only_supplied = (
+            not payload.pages
+            and not legacy_supplied
+            and payload.page_count is not None
+            and bool((payload.document_text or "").strip())
+        )
+        if sum((bool(payload.pages), legacy_supplied, text_only_supplied)) != 1:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Provide either one image or an ordered page list",
+                detail="Provide one image, an ordered page list, or a verified PDF text layer",
             )
         decoded_pages: list[tuple[bytes, str, str, int]] = []
         if payload.pages:
@@ -731,7 +738,7 @@ def create_app(
             decoded_pages.sort(key=lambda item: item[3])
             if [page[3] for page in decoded_pages] != list(range(1, len(decoded_pages) + 1)):
                 raise HTTPException(status_code=422, detail="PDF page numbers must be continuous from 1")
-        else:
+        elif legacy_supplied:
             if not payload.filename or not payload.content_type or not payload.image_base64:
                 raise HTTPException(status_code=422, detail="Single-image request is incomplete")
             try:
@@ -750,10 +757,11 @@ def create_app(
                 (image, Path(payload.filename).name, payload.content_type, 1)
             )
         try:
-            if payload.pages:
+            if payload.pages or text_only_supplied:
                 return active_vision_client.recognize_document(
                     decoded_pages,
                     document_text=payload.document_text,
+                    page_count_override=payload.page_count,
                     model_override=payload.model,
                     classify=payload.classify,
                     subject_company_name=payload.subject_company_name,

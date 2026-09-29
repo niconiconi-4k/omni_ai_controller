@@ -202,6 +202,48 @@ def test_openai_vision_sends_ordered_pdf_pages_and_layout_text(tmp_path: Path) -
     assert result["image"]["page_count"] == 2
 
 
+def test_openai_vision_uses_verified_text_layer_without_images(tmp_path: Path) -> None:
+    store = VisionSettingsStore(tmp_path / "vision.json")
+    store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
+    response = {
+        "id": "request-text-pdf-1",
+        "model": "gpt-6-sol",
+        "choices": [{"message": {"content": json.dumps({
+            "status": "accepted", "reasons": [], "primary_receipt_index": None,
+            "text": "12 July payslips", "financial_facts": {}, "classification": {},
+            "receipts": [{
+                "page_start": 1, "page_end": 1, "relevance": "excluded",
+                "relevance_reason": "July document outside September audit",
+                "document_date_text": "2026-07-31", "document_date_iso": "2026-07-31",
+                "due_date_text": None, "due_date_iso": None,
+                "text": "July payslip", "payment_candidates": [],
+                "financial_facts": {}, "classification": {},
+            }],
+        })}}],
+        "usage": {"prompt_tokens": 500, "completion_tokens": 100, "total_tokens": 600},
+    }
+
+    with patch("omni_ai_controller.vision.urlopen", return_value=FakeResponse(response)) as request:
+        result = OpenAIVisionClient(store).recognize_document(
+            [],
+            page_count_override=12,
+            document_text="=== PDF PAGE 1/12 ===\nLönebesked 2026-07-31",
+            model_override="gpt-6-sol",
+            audit_period_start="2026-09-01",
+            audit_period_end="2026-09-30",
+        )
+
+    sent_payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
+    content = sent_payload["messages"][0]["content"]
+    assert not any(item["type"] == "image_url" for item in content)
+    assert "already passed local quality checks" in content[0]["text"]
+    assert "Do not spend output tokens" in content[0]["text"]
+    assert result["status"] == "accepted"
+    assert result["primary_receipt_index"] is None
+    assert result["image"]["page_count"] == 12
+    assert result["image"]["recognition_mode"] == "text_layer"
+
+
 def test_openai_vision_keeps_excluded_receipts_out_of_primary_summary(tmp_path: Path) -> None:
     store = VisionSettingsStore(tmp_path / "vision.json")
     store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")

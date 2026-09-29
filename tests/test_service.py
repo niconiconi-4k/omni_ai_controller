@@ -401,6 +401,7 @@ class FakeVisionClient:
         pages: list[tuple[bytes, str, str, int]],
         *,
         document_text: str | None,
+        page_count_override: int | None = None,
         model_override: str | None = None,
         classify: bool = True,
         subject_company_name: str | None = None,
@@ -413,6 +414,7 @@ class FakeVisionClient:
             "model": {"provider": "openai", "vision": model_override or "gpt-4o"},
             "receipts": [{"index": 1, "text": document_text or "", "payment_candidates": []}],
             "pages": [page_number for _, _, _, page_number in pages],
+            "page_count": page_count_override or len(pages),
             "classify": classify,
             "subject_company_name": subject_company_name,
             "audit_period_start": audit_period_start,
@@ -621,6 +623,23 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         assert analyzed_pdf.json()["pages"] == [1, 2]
         assert analyzed_pdf.json()["classify"] is False
         assert analyzed_pdf.json()["subject_company_name"] == "Buyer AB"
+
+        analyzed_text_pdf = test_client.post(
+            "/internal/vision/receipts",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "page_count": 2,
+                "document_text": (
+                    "=== PDF PAGE 1/2 ===\nInvoice July 2026\n\n"
+                    "=== PDF PAGE 2/2 ===\nTerms omitted"
+                ),
+                "model": "gpt-6-sol",
+                "classify": True,
+            },
+        )
+        assert analyzed_text_pdf.status_code == 200
+        assert analyzed_text_pdf.json()["pages"] == []
+        assert analyzed_text_pdf.json()["page_count"] == 2
 
         invalid_pdf = test_client.post(
             "/internal/vision/receipts",
