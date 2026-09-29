@@ -148,16 +148,15 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
     assert "classification" in schema["properties"]
     assert "receipts" in schema["properties"]
     receipt_schema = schema["properties"]["receipts"]["items"]
-    assert receipt_schema["properties"]["relevance"]["enum"] == [
-        "included", "excluded", "needs_review",
-    ]
+    assert receipt_schema["properties"]["relevance"]["enum"] == ["unassessed"]
     assert "bank_voucher" not in schema["properties"]["classification"]["properties"]["document_type"]["enum"]
     instruction = sent_payload["messages"][0]["content"][0]["text"]
     assert 'subject company name is "Buyer AB"' in instruction
     assert "determine transaction direction before document type" in instruction
     assert "An invoice is not inherently income" in instruction
     assert "Kreditfaktura/Kreditnota" in instruction
-    assert 'audit period is "2026-09-01" through "2026-09-30"' in instruction
+    assert 'audit period is "2026-09-01" through "2026-09-30"' not in instruction
+    assert "Do not decide audit-period" in instruction
     assert "Do not transcribe advertisements" in instruction
     assert "Split every distinct financial document" in instruction
 
@@ -216,8 +215,9 @@ def test_openai_vision_uses_verified_text_layer_without_images(tmp_path: Path) -
                 "relevance_reason": "July document outside September audit",
                 "document_date_text": "2026-07-31", "document_date_iso": "2026-07-31",
                 "due_date_text": None, "due_date_iso": None,
-                "text": "July payslip", "payment_candidates": [],
-                "financial_facts": {}, "classification": {},
+                    "text": "July payslip", "payment_candidates": [],
+                    "financial_facts": {},
+                    "classification": {"document_type": "payroll_voucher"},
             }],
         })}}],
         "usage": {"prompt_tokens": 500, "completion_tokens": 100, "total_tokens": 600},
@@ -237,14 +237,21 @@ def test_openai_vision_uses_verified_text_layer_without_images(tmp_path: Path) -
     content = sent_payload["messages"][0]["content"]
     assert not any(item["type"] == "image_url" for item in content)
     assert "already passed local quality checks" in content[0]["text"]
-    assert "Do not spend output tokens" in content[0]["text"]
+    assert "at most 500 characters" in content[0]["text"]
+    assert "relevance=unassessed" in content[0]["text"]
+    assert "deferred_to_audit" in content[0]["text"]
+    assert "Nettolön" in content[0]["text"]
     assert result["status"] == "accepted"
-    assert result["primary_receipt_index"] is None
+    assert result["primary_receipt_index"] == 1
+    assert result["receipts"][0]["relevance"] == "unassessed"
+    assert result["receipts"][0]["relevance_reason"] == "deferred_to_audit"
     assert result["image"]["page_count"] == 12
     assert result["image"]["recognition_mode"] == "text_layer"
+    assert result["receipts"][0]["financial_extraction_complete"] is False
+    assert result["receipts"][0]["financial_extraction_issue"] == "payroll_final_amount_missing"
 
 
-def test_openai_vision_keeps_excluded_receipts_out_of_primary_summary(tmp_path: Path) -> None:
+def test_openai_vision_defers_all_receipt_relevance_to_audit(tmp_path: Path) -> None:
     store = VisionSettingsStore(tmp_path / "vision.json")
     store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
 
@@ -300,8 +307,12 @@ def test_openai_vision_keeps_excluded_receipts_out_of_primary_summary(tmp_path: 
 
     assert result["status"] == "accepted"
     assert result["primary_receipt_index"] == 2
-    assert result["receipts"][0]["relevance"] == "excluded"
-    assert result["receipts"][1]["relevance"] == "included"
+    assert result["receipts"][0]["relevance"] == "unassessed"
+    assert result["receipts"][1]["relevance"] == "unassessed"
+    assert all(
+        receipt["relevance_reason"] == "deferred_to_audit"
+        for receipt in result["receipts"]
+    )
     assert result["financial_facts"]["amount_decimal"] == "123.00"
 
 

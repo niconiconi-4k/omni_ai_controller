@@ -134,7 +134,7 @@ RECEIPT_RESULT_SCHEMA: dict[str, Any] = {
         "page_end": {"type": "integer", "minimum": 1, "maximum": 12},
         "relevance": {
             "type": "string",
-            "enum": ["included", "excluded", "needs_review"],
+            "enum": ["unassessed"],
         },
         "relevance_reason": {"type": "string"},
         "document_date_text": {"type": ["string", "null"]},
@@ -350,15 +350,20 @@ class OpenAIVisionClient:
                     "Analyze the ordered PDF page content as a document package that may contain multiple distinct "
                     "invoices, receipts, credit notes, reminders, or unrelated historical documents. Split "
                     "every distinct financial document into one receipts item and give its inclusive page "
-                    "range. Do not treat advertisements, generic terms, legal boilerplate, navigation, "
+                    "range. Every identified receipt must receive its own complete financial facts and "
+                    "classification; never collapse multiple receipts into one result. Do not treat "
+                    "advertisements, generic terms, legal boilerplate, navigation, "
                     "repeated headers/footers, or long transaction-history appendices as separate receipts. "
-                    "For each receipt, output only a compact audit-relevant excerpt (normally at most 1200 "
-                    "characters): issuer and recipient, document/invoice/reference number, document date, "
+                    "For each receipt, output only a compact financial summary of at most 500 "
+                    "characters: issuer and recipient, document/invoice/reference number, document date, "
                     "due date, final paid or payable total, currency, payment account/OCR/reference, and any "
-                    "line necessary to justify classification or relevance. For an excluded receipt, stop after "
-                    "relevance is established: keep text under 240 characters, leave payment_candidates empty, "
-                    "set financial fact values to null with empty arrays, and return an uncertain null classification. "
-                    "Do not spend output tokens extracting or classifying content that has already been excluded. "
+                    "line necessary to justify classification. Financial facts must contain that receipt's "
+                    "final payable or paid amount whenever it is visible. For payroll documents, use the net "
+                    "final payment labelled Nettolön, Netto lön, Att utbetala, Utbetalas, Utbetalt, or the "
+                    "equivalent—not Bruttolön or Månadslön—and include at most three amount candidates per "
+                    "receipt. Set relevance=unassessed and "
+                    "relevance_reason='deferred_to_audit' for every financial receipt. Do not decide audit-period, "
+                    "company-ownership or duplicate relevance during recognition. "
                     "Do not transcribe advertisements, "
                     "terms, policies, explanatory prose, or full transaction tables. "
                     + (
@@ -371,22 +376,10 @@ class OpenAIVisionClient:
                     "characters exactly and never merge unrelated rows or amounts. "
                     "The service-side subject company name is "
                     + json.dumps((subject_company_name or "").strip()[:255], ensure_ascii=False)
-                    + ". The audit period is "
-                    + json.dumps((audit_period_start or "").strip(), ensure_ascii=False)
-                    + " through "
-                    + json.dumps((audit_period_end or "").strip(), ensure_ascii=False)
-                    + ". Treat company identity as context only when it is specific and visibly matches. "
-                    "Use document/service/transaction date as the primary period evidence. A due date far before "
-                    "the audit period (normally more than 60 days) may establish an old receipt when no visible "
-                    "date contradicts it; near period boundaries or conflicting dates require needs_review. Mark "
-                    "relevance=excluded only when "
-                    "strong evidence shows that a receipt belongs outside the supplied audit period, is a duplicate, "
-                    "or belongs to another company. Use needs_review when dates or ownership are ambiguous. If no "
-                    "audit period is supplied, do not exclude a receipt merely because it is old. Select one "
-                    "1-based primary_receipt_index from included receipts for the compatible top-level summary; if there is "
-                    "no clear primary receipt among otherwise applicable items, return null and "
-                    "needs_manual_confirmation. If every receipt is confidently excluded, return accepted with a null "
-                    "primary receipt because that is a complete successful result. Top-level text must be "
+                    + ". Treat company identity as classification context only when it is specific and visibly matches. "
+                    "Select one 1-based primary_receipt_index as a backward-compatible representative receipt. "
+                    "This does not make other receipts secondary or optional: every receipt must still be extracted "
+                    "and classified independently. Top-level text must be "
                     "a package summary under 500 characters and must not repeat receipt excerpts; top-level "
                     "financial_facts and classification must describe only the selected primary receipt. "
                     + classification_instruction
@@ -550,8 +543,8 @@ class OpenAIVisionClient:
             raw_receipts = [{
                 "page_start": 1,
                 "page_end": page_count,
-                "relevance": "needs_review",
-                "relevance_reason": "模型未返回逐票据拆分结果",
+                "relevance": "unassessed",
+                "relevance_reason": "deferred_to_audit",
                 "document_date_text": None,
                 "document_date_iso": None,
                 "due_date_text": None,
@@ -570,40 +563,54 @@ class OpenAIVisionClient:
                 page_end = max(page_start, min(int(raw_receipt.get("page_end") or page_start), page_count))
             except (TypeError, ValueError, OverflowError):
                 page_start = page_end = 1
-            relevance = str(raw_receipt.get("relevance") or "needs_review")
-            if relevance not in {"included", "excluded", "needs_review"}:
-                relevance = "needs_review"
             receipt_facts = raw_receipt.get("financial_facts")
             receipt_classification = raw_receipt.get("classification")
-            receipts.append({
+            normalized_receipt = {
                 "index": index,
                 "page_start": page_start,
                 "page_end": page_end,
-                "relevance": relevance,
-                "relevance_reason": str(raw_receipt.get("relevance_reason") or "")[:1000],
+                "relevance": "unassessed",
+                "relevance_reason": "deferred_to_audit",
                 "document_date_text": raw_receipt.get("document_date_text"),
                 "document_date_iso": raw_receipt.get("document_date_iso"),
                 "due_date_text": raw_receipt.get("due_date_text"),
                 "due_date_iso": raw_receipt.get("due_date_iso"),
-                "text": str(raw_receipt.get("text") or "")[:4000],
+                "text": str(raw_receipt.get("text") or "")[:500],
                 "lines": [],
-                "payment_candidates": normalize_candidates(raw_receipt.get("payment_candidates")),
+                "payment_candidates": normalize_candidates(
+                    raw_receipt.get("payment_candidates")
+                )[:3],
                 "financial_facts": receipt_facts if isinstance(receipt_facts, dict) else {},
                 "classification": (
                     receipt_classification if isinstance(receipt_classification, dict) else {}
                 ),
-            })
+            }
+            classification_type = str(
+                normalized_receipt["classification"].get("document_type") or ""
+            )
+            normalized_facts = normalized_receipt["financial_facts"]
+            has_amount = bool(str(normalized_facts.get("amount_decimal") or "").strip())
+            extraction_complete = classification_type != "payroll_voucher" or has_amount
+            normalized_receipt["financial_extraction_complete"] = extraction_complete
+            normalized_receipt["financial_extraction_issue"] = (
+                None if extraction_complete else "payroll_final_amount_missing"
+            )
+            receipts.append(normalized_receipt)
         requested_primary = result.get("primary_receipt_index")
         primary = next(
             (
                 receipt for receipt in receipts
-                if receipt["index"] == requested_primary and receipt["relevance"] == "included"
+                if receipt["index"] == requested_primary
+                and receipt["relevance"] in {"unassessed", "included"}
             ),
             None,
         )
         if primary is None:
             primary = next(
-                (receipt for receipt in receipts if receipt["relevance"] == "included"),
+                (
+                    receipt for receipt in receipts
+                    if receipt["relevance"] in {"unassessed", "included"}
+                ),
                 None,
             )
         status = str(result.get("status") or "needs_manual_confirmation")
