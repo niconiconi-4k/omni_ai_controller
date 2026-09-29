@@ -225,6 +225,8 @@ class VisionAnalyzeRequest(BaseModel):
     model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] | None = None
     classify: bool = True
     subject_company_name: str | None = Field(default=None, max_length=255)
+    audit_period_start: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    audit_period_end: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
 
 
 class StatementPageRequest(BaseModel):
@@ -755,6 +757,8 @@ def create_app(
                     model_override=payload.model,
                     classify=payload.classify,
                     subject_company_name=payload.subject_company_name,
+                    audit_period_start=payload.audit_period_start,
+                    audit_period_end=payload.audit_period_end,
                 )
             image, filename, content_type, _ = decoded_pages[0]
             return active_vision_client.recognize(
@@ -764,6 +768,8 @@ def create_app(
                 model_override=payload.model,
                 classify=payload.classify,
                 subject_company_name=payload.subject_company_name,
+                audit_period_start=payload.audit_period_start,
+                audit_period_end=payload.audit_period_end,
             )
         except VisionRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

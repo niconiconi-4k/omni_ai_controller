@@ -127,6 +127,8 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
             filename="receipt.png",
             content_type="image/png",
             subject_company_name="Buyer AB",
+            audit_period_start="2026-09-01",
+            audit_period_end="2026-09-30",
         )
 
     assert result["request_id"] == "request-1"
@@ -144,12 +146,20 @@ def test_openai_vision_normalizes_receipt_result(tmp_path: Path) -> None:
     schema = sent_payload["response_format"]["json_schema"]["schema"]
     assert "financial_facts" in schema["properties"]
     assert "classification" in schema["properties"]
+    assert "receipts" in schema["properties"]
+    receipt_schema = schema["properties"]["receipts"]["items"]
+    assert receipt_schema["properties"]["relevance"]["enum"] == [
+        "included", "excluded", "needs_review",
+    ]
     assert "bank_voucher" not in schema["properties"]["classification"]["properties"]["document_type"]["enum"]
     instruction = sent_payload["messages"][0]["content"][0]["text"]
     assert 'subject company name is "Buyer AB"' in instruction
     assert "determine transaction direction before document type" in instruction
     assert "An invoice is not inherently income" in instruction
     assert "Kreditfaktura/Kreditnota" in instruction
+    assert 'audit period is "2026-09-01" through "2026-09-30"' in instruction
+    assert "Do not transcribe advertisements" in instruction
+    assert "Split every distinct financial document" in instruction
 
 
 def test_openai_vision_requires_configuration(tmp_path: Path) -> None:
@@ -192,6 +202,67 @@ def test_openai_vision_sends_ordered_pdf_pages_and_layout_text(tmp_path: Path) -
     assert result["image"]["page_count"] == 2
 
 
+def test_openai_vision_keeps_excluded_receipts_out_of_primary_summary(tmp_path: Path) -> None:
+    store = VisionSettingsStore(tmp_path / "vision.json")
+    store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
+
+    def facts(amount: str) -> dict[str, object]:
+        return {
+            "amount_text": f"{amount} SEK", "amount_decimal": amount, "currency": "SEK",
+            "reference_numbers": [], "account_numbers": [],
+            "transaction_time_text": None, "transaction_time_iso": None,
+            "payer": {"name": "Buyer AB", "organization_number": None},
+            "payee": {"name": "Seller AB", "organization_number": None},
+        }
+
+    classification = {
+        "document_type": "expense_voucher", "is_certain": True, "confidence": 0.96,
+        "reason": "supplier invoice", "evidence": ["Fakturamottagare Buyer AB"],
+    }
+    response = {
+        "id": "request-multi-1", "model": "gpt-6-sol",
+        "choices": [{"message": {"content": json.dumps({
+            "status": "accepted", "reasons": [], "primary_receipt_index": 2,
+            "text": "Two invoices", "financial_facts": facts("999.00"),
+            "classification": classification,
+            "receipts": [
+                {
+                    "page_start": 1, "page_end": 1, "relevance": "excluded",
+                    "relevance_reason": "February invoice outside September audit",
+                    "document_date_text": "2026-02-01", "document_date_iso": "2026-02-01",
+                    "due_date_text": "2026-02-28", "due_date_iso": "2026-02-28",
+                    "text": "Old invoice total 999 SEK", "payment_candidates": [],
+                    "financial_facts": facts("999.00"), "classification": classification,
+                },
+                {
+                    "page_start": 2, "page_end": 2, "relevance": "included",
+                    "relevance_reason": "September invoice",
+                    "document_date_text": "2026-09-03", "document_date_iso": "2026-09-03",
+                    "due_date_text": "2026-09-30", "due_date_iso": "2026-09-30",
+                    "text": "Current invoice total 123 SEK", "payment_candidates": [],
+                    "financial_facts": facts("123.00"), "classification": classification,
+                },
+            ],
+        })}}],
+        "usage": {},
+    }
+
+    with patch("omni_ai_controller.vision.urlopen", return_value=FakeResponse(response)):
+        result = OpenAIVisionClient(store).recognize_document(
+            [(b"old", "page-001.jpg", "image/jpeg", 1),
+             (b"current", "page-002.jpg", "image/jpeg", 2)],
+            document_text="old invoice\ncurrent invoice",
+            audit_period_start="2026-09-01",
+            audit_period_end="2026-09-30",
+        )
+
+    assert result["status"] == "accepted"
+    assert result["primary_receipt_index"] == 2
+    assert result["receipts"][0]["relevance"] == "excluded"
+    assert result["receipts"][1]["relevance"] == "included"
+    assert result["financial_facts"]["amount_decimal"] == "123.00"
+
+
 def test_gpt_6_sol_uses_compatible_chat_completion_parameters(tmp_path: Path) -> None:
     store = VisionSettingsStore(tmp_path / "vision.json")
     store.save(model="gpt-4o", api_key="sk-test-012345678901234567890")
@@ -217,7 +288,7 @@ def test_gpt_6_sol_uses_compatible_chat_completion_parameters(tmp_path: Path) ->
     sent_payload = json.loads(request.call_args.args[0].data.decode("utf-8"))
     assert sent_payload["model"] == "gpt-6-sol"
     assert sent_payload["reasoning_effort"] == "none"
-    assert sent_payload["max_completion_tokens"] == 4096
+    assert sent_payload["max_completion_tokens"] == 8192
     assert "max_tokens" not in sent_payload
     assert "Do not classify this document" in sent_payload["messages"][0]["content"][0]["text"]
     assert result["model"]["vision"] == "gpt-6-sol"

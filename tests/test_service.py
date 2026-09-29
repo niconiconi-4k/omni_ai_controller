@@ -381,6 +381,8 @@ class FakeVisionClient:
         model_override: str | None = None,
         classify: bool = True,
         subject_company_name: str | None = None,
+        audit_period_start: str | None = None,
+        audit_period_end: str | None = None,
     ) -> dict[str, object]:
         return {
             "request_id": "vision-1",
@@ -390,6 +392,8 @@ class FakeVisionClient:
             "size": len(image),
             "content_type": content_type,
             "subject_company_name": subject_company_name,
+            "audit_period_start": audit_period_start,
+            "audit_period_end": audit_period_end,
         }
 
     def recognize_document(
@@ -400,6 +404,8 @@ class FakeVisionClient:
         model_override: str | None = None,
         classify: bool = True,
         subject_company_name: str | None = None,
+        audit_period_start: str | None = None,
+        audit_period_end: str | None = None,
     ) -> dict[str, object]:
         return {
             "request_id": "vision-document-1",
@@ -409,6 +415,8 @@ class FakeVisionClient:
             "pages": [page_number for _, _, _, page_number in pages],
             "classify": classify,
             "subject_company_name": subject_company_name,
+            "audit_period_start": audit_period_start,
+            "audit_period_end": audit_period_end,
         }
 
 

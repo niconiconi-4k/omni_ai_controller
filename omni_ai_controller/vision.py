@@ -63,6 +63,96 @@ VOUCHER_CLASSIFICATION_INSTRUCTION = (
     "status=needs_manual_confirmation."
 )
 
+PAYMENT_CANDIDATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "text": {"type": "string"},
+        "amount": {"type": "string"},
+        "currency": {"type": ["string", "null"]},
+        "keyword": {"type": ["string", "null"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["text", "amount", "currency", "keyword", "confidence"],
+}
+
+PARTY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "name": {"type": ["string", "null"]},
+        "organization_number": {"type": ["string", "null"]},
+    },
+    "required": ["name", "organization_number"],
+}
+
+FINANCIAL_FACTS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "amount_text": {"type": ["string", "null"]},
+        "amount_decimal": {"type": ["string", "null"]},
+        "currency": {"type": ["string", "null"]},
+        "reference_numbers": {"type": "array", "items": {"type": "string"}},
+        "account_numbers": {"type": "array", "items": {"type": "string"}},
+        "transaction_time_text": {"type": ["string", "null"]},
+        "transaction_time_iso": {"type": ["string", "null"]},
+        "payer": PARTY_SCHEMA,
+        "payee": PARTY_SCHEMA,
+    },
+    "required": [
+        "amount_text", "amount_decimal", "currency", "reference_numbers",
+        "account_numbers", "transaction_time_text", "transaction_time_iso",
+        "payer", "payee",
+    ],
+}
+
+CLASSIFICATION_RESULT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "document_type": {
+            "type": ["string", "null"],
+            "enum": [
+                "income_voucher", "expense_voucher", "payroll_voucher",
+                "loan_interest_voucher", "tax_voucher", None,
+            ],
+        },
+        "is_certain": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["document_type", "is_certain", "confidence", "reason", "evidence"],
+}
+
+RECEIPT_RESULT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "page_start": {"type": "integer", "minimum": 1, "maximum": 12},
+        "page_end": {"type": "integer", "minimum": 1, "maximum": 12},
+        "relevance": {
+            "type": "string",
+            "enum": ["included", "excluded", "needs_review"],
+        },
+        "relevance_reason": {"type": "string"},
+        "document_date_text": {"type": ["string", "null"]},
+        "document_date_iso": {"type": ["string", "null"]},
+        "due_date_text": {"type": ["string", "null"]},
+        "due_date_iso": {"type": ["string", "null"]},
+        "text": {"type": "string"},
+        "payment_candidates": {"type": "array", "items": PAYMENT_CANDIDATE_SCHEMA},
+        "financial_facts": FINANCIAL_FACTS_SCHEMA,
+        "classification": CLASSIFICATION_RESULT_SCHEMA,
+    },
+    "required": [
+        "page_start", "page_end", "relevance", "relevance_reason",
+        "document_date_text", "document_date_iso", "due_date_text", "due_date_iso",
+        "text", "payment_candidates", "financial_facts", "classification",
+    ],
+}
+
 
 class VisionSettingsError(RuntimeError):
     """Raised when protected OpenAI vision settings cannot be read or changed."""
@@ -192,6 +282,8 @@ class OpenAIVisionClient:
         model_override: str | None = None,
         classify: bool = True,
         subject_company_name: str | None = None,
+        audit_period_start: str | None = None,
+        audit_period_end: str | None = None,
     ) -> dict[str, Any]:
         return self.recognize_document(
             [(image, filename, content_type, 1)],
@@ -199,6 +291,8 @@ class OpenAIVisionClient:
             model_override=model_override,
             classify=classify,
             subject_company_name=subject_company_name,
+            audit_period_start=audit_period_start,
+            audit_period_end=audit_period_end,
         )
 
     def recognize_document(
@@ -209,6 +303,8 @@ class OpenAIVisionClient:
         model_override: str | None = None,
         classify: bool = True,
         subject_company_name: str | None = None,
+        audit_period_start: str | None = None,
+        audit_period_end: str | None = None,
     ) -> dict[str, Any]:
         if not pages:
             raise VisionRequestError("文档不包含可识别页面", status_code=400)
@@ -245,16 +341,36 @@ class OpenAIVisionClient:
             {
                 "type": "text",
                 "text": (
-                    "Analyze exactly one financial document supplied as ordered rendered pages. Preserve "
-                    "page order, columns, tables, labels and values; never merge unrelated rows or amounts. "
-                    "Preserve all visible text and extract facts without guessing. Masked account/card "
-                    "numbers must retain every visible '*' and digit exactly. Extract the final paid or "
-                    "payable amount, ISO currency when visible, reference/OCR/payment identifiers, account "
-                    "or card numbers, transaction time, and payer/payee company names and organization/tax "
-                    "numbers. "
+                    "Analyze the ordered pages as a document package that may contain multiple distinct "
+                    "invoices, receipts, credit notes, reminders, or unrelated historical documents. Split "
+                    "every distinct financial document into one receipts item and give its inclusive page "
+                    "range. Do not treat advertisements, generic terms, legal boilerplate, navigation, "
+                    "repeated headers/footers, or long transaction-history appendices as separate receipts. "
+                    "For each receipt, output only a compact audit-relevant excerpt (normally at most 1200 "
+                    "characters): issuer and recipient, document/invoice/reference number, document date, "
+                    "due date, final paid or payable total, currency, payment account/OCR/reference, and any "
+                    "line necessary to justify classification or relevance. Do not transcribe advertisements, "
+                    "terms, policies, explanatory prose, or full transaction tables. Inspect every rendered "
+                    "page even when the PDF text layer is long or omitted. Preserve visible masked account/card "
+                    "characters exactly and never merge unrelated rows or amounts. "
                     "The service-side subject company name is "
                     + json.dumps((subject_company_name or "").strip()[:255], ensure_ascii=False)
-                    + ". Treat it as identity context only when it is specific and visibly matches the document. "
+                    + ". The audit period is "
+                    + json.dumps((audit_period_start or "").strip(), ensure_ascii=False)
+                    + " through "
+                    + json.dumps((audit_period_end or "").strip(), ensure_ascii=False)
+                    + ". Treat company identity as context only when it is specific and visibly matches. "
+                    "Use document/service/transaction date as the primary period evidence. A due date far before "
+                    "the audit period (normally more than 60 days) may establish an old receipt when no visible "
+                    "date contradicts it; near period boundaries or conflicting dates require needs_review. Mark "
+                    "relevance=excluded only when "
+                    "strong evidence shows that a receipt belongs outside the supplied audit period, is a duplicate, "
+                    "or belongs to another company. Use needs_review when dates or ownership are ambiguous. If no "
+                    "audit period is supplied, do not exclude a receipt merely because it is old. Select one "
+                    "1-based primary_receipt_index from included receipts for the compatible top-level summary; if there is "
+                    "no clear primary receipt, return null and needs_manual_confirmation. Top-level text must be "
+                    "a package summary under 500 characters and must not repeat receipt excerpts; top-level "
+                    "financial_facts and classification must describe only the selected primary receipt. "
                     + classification_instruction
                     + " Use needs_reupload only when page quality prevents reliable reading. Return only "
                     "data matching the supplied JSON schema."
@@ -312,90 +428,18 @@ class OpenAIVisionClient:
                                 "enum": ["accepted", "needs_manual_confirmation", "needs_reupload"],
                             },
                             "reasons": {"type": "array", "items": {"type": "string"}},
+                            "primary_receipt_index": {"type": ["integer", "null"], "minimum": 1},
                             "text": {"type": "string"},
-                            "payment_candidates": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "text": {"type": "string"},
-                                        "amount": {"type": "string"},
-                                        "currency": {"type": ["string", "null"]},
-                                        "keyword": {"type": ["string", "null"]},
-                                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                                    },
-                                    "required": ["text", "amount", "currency", "keyword", "confidence"],
-                                },
+                            "receipts": {
+                                "type": "array", "minItems": 1, "maxItems": 36,
+                                "items": RECEIPT_RESULT_SCHEMA,
                             },
-                            "financial_facts": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "amount_text": {"type": ["string", "null"]},
-                                    "amount_decimal": {"type": ["string", "null"]},
-                                    "currency": {"type": ["string", "null"]},
-                                    "reference_numbers": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                    },
-                                    "account_numbers": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                    },
-                                    "transaction_time_text": {"type": ["string", "null"]},
-                                    "transaction_time_iso": {"type": ["string", "null"]},
-                                    "payer": {
-                                        "type": "object",
-                                        "additionalProperties": False,
-                                        "properties": {
-                                            "name": {"type": ["string", "null"]},
-                                            "organization_number": {"type": ["string", "null"]},
-                                        },
-                                        "required": ["name", "organization_number"],
-                                    },
-                                    "payee": {
-                                        "type": "object",
-                                        "additionalProperties": False,
-                                        "properties": {
-                                            "name": {"type": ["string", "null"]},
-                                            "organization_number": {"type": ["string", "null"]},
-                                        },
-                                        "required": ["name", "organization_number"],
-                                    },
-                                },
-                                "required": [
-                                    "amount_text", "amount_decimal", "currency",
-                                    "reference_numbers", "account_numbers",
-                                    "transaction_time_text", "transaction_time_iso",
-                                    "payer", "payee"
-                                ],
-                            },
-                            "classification": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "document_type": {
-                                        "type": ["string", "null"],
-                                        "enum": [
-                                            "income_voucher", "expense_voucher",
-                                            "payroll_voucher", "loan_interest_voucher",
-                                            "tax_voucher", None
-                                        ],
-                                    },
-                                    "is_certain": {"type": "boolean"},
-                                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                                    "reason": {"type": "string"},
-                                    "evidence": {"type": "array", "items": {"type": "string"}},
-                                },
-                                "required": [
-                                    "document_type", "is_certain", "confidence", "reason", "evidence"
-                                ],
-                            },
+                            "financial_facts": FINANCIAL_FACTS_SCHEMA,
+                            "classification": CLASSIFICATION_RESULT_SCHEMA,
                         },
                         "required": [
-                            "status", "reasons", "text", "payment_candidates",
-                            "financial_facts", "classification"
+                            "status", "reasons", "primary_receipt_index", "text", "receipts",
+                            "financial_facts", "classification",
                         ],
                     },
                 },
@@ -404,10 +448,10 @@ class OpenAIVisionClient:
         if model == "gpt-6-sol":
             payload["reasoning_effort"] = "none"
             payload["temperature"] = 0
-            payload["max_completion_tokens"] = 4096
+            payload["max_completion_tokens"] = 8192
         else:
             payload["temperature"] = 0
-            payload["max_tokens"] = 4096
+            payload["max_tokens"] = 8192
         request = Request(
             OPENAI_CHAT_COMPLETIONS_URL,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -451,37 +495,118 @@ class OpenAIVisionClient:
         if not isinstance(result, dict):
             raise VisionRequestError("OpenAI 返回了无效的识图结果")
 
-        payment_candidates: list[dict[str, Any]] = []
-        for index, candidate in enumerate(result.get("payment_candidates") or []):
-            if not isinstance(candidate, dict) or not candidate.get("amount"):
+        def normalize_candidates(raw_candidates: Any) -> list[dict[str, Any]]:
+            normalized: list[dict[str, Any]] = []
+            if not isinstance(raw_candidates, list):
+                return normalized
+            for index, candidate in enumerate(raw_candidates):
+                if not isinstance(candidate, dict) or not candidate.get("amount"):
+                    continue
+                currency = str(candidate.get("currency") or "").strip().casefold()
+                keyword = str(candidate.get("keyword") or "total").strip().casefold()
+                try:
+                    confidence = max(0.0, min(float(candidate.get("confidence") or 0), 1.0))
+                except (TypeError, ValueError, OverflowError):
+                    confidence = 0.0
+                normalized.append(
+                    {
+                        "line_index": index,
+                        "text": str(candidate.get("text") or "")[:1000],
+                        "amounts": [str(candidate["amount"])[:100]],
+                        "keywords": [keyword[:100]] if keyword else [],
+                        "currencies": [currency[:20]] if currency else [],
+                        "confidence": confidence,
+                    }
+                )
+            return normalized
+
+        raw_receipts = result.get("receipts")
+        uses_receipt_schema = isinstance(raw_receipts, list) and bool(raw_receipts)
+        if not isinstance(raw_receipts, list) or not raw_receipts:
+            raw_receipts = [{
+                "page_start": 1,
+                "page_end": len(pages),
+                "relevance": "needs_review",
+                "relevance_reason": "模型未返回逐票据拆分结果",
+                "document_date_text": None,
+                "document_date_iso": None,
+                "due_date_text": None,
+                "due_date_iso": None,
+                "text": result.get("text") or "",
+                "payment_candidates": result.get("payment_candidates") or [],
+                "financial_facts": result.get("financial_facts") or {},
+                "classification": result.get("classification") or {},
+            }]
+        receipts: list[dict[str, Any]] = []
+        for index, raw_receipt in enumerate(raw_receipts, start=1):
+            if not isinstance(raw_receipt, dict):
                 continue
-            currency = str(candidate.get("currency") or "").strip().casefold()
-            keyword = str(candidate.get("keyword") or "total").strip().casefold()
-            confidence = max(0.0, min(float(candidate.get("confidence") or 0), 1.0))
-            payment_candidates.append(
-                {
-                    "line_index": index,
-                    "text": str(candidate.get("text") or ""),
-                    "amounts": [str(candidate["amount"])],
-                    "keywords": [keyword] if keyword else [],
-                    "currencies": [currency] if currency else [],
-                    "confidence": confidence,
-                }
+            try:
+                page_start = max(1, min(int(raw_receipt.get("page_start") or 1), len(pages)))
+                page_end = max(page_start, min(int(raw_receipt.get("page_end") or page_start), len(pages)))
+            except (TypeError, ValueError, OverflowError):
+                page_start = page_end = 1
+            relevance = str(raw_receipt.get("relevance") or "needs_review")
+            if relevance not in {"included", "excluded", "needs_review"}:
+                relevance = "needs_review"
+            receipt_facts = raw_receipt.get("financial_facts")
+            receipt_classification = raw_receipt.get("classification")
+            receipts.append({
+                "index": index,
+                "page_start": page_start,
+                "page_end": page_end,
+                "relevance": relevance,
+                "relevance_reason": str(raw_receipt.get("relevance_reason") or "")[:1000],
+                "document_date_text": raw_receipt.get("document_date_text"),
+                "document_date_iso": raw_receipt.get("document_date_iso"),
+                "due_date_text": raw_receipt.get("due_date_text"),
+                "due_date_iso": raw_receipt.get("due_date_iso"),
+                "text": str(raw_receipt.get("text") or "")[:4000],
+                "lines": [],
+                "payment_candidates": normalize_candidates(raw_receipt.get("payment_candidates")),
+                "financial_facts": receipt_facts if isinstance(receipt_facts, dict) else {},
+                "classification": (
+                    receipt_classification if isinstance(receipt_classification, dict) else {}
+                ),
+            })
+        requested_primary = result.get("primary_receipt_index")
+        primary = next(
+            (
+                receipt for receipt in receipts
+                if receipt["index"] == requested_primary and receipt["relevance"] == "included"
+            ),
+            None,
+        )
+        if primary is None:
+            primary = next(
+                (receipt for receipt in receipts if receipt["relevance"] == "included"),
+                None,
             )
         status = str(result.get("status") or "needs_manual_confirmation")
         if status not in {"accepted", "needs_manual_confirmation", "needs_reupload"}:
             status = "needs_manual_confirmation"
+        if primary is None and status == "accepted":
+            status = "needs_manual_confirmation"
         response_model = str(response_payload.get("model") or model)
-        financial_facts = result.get("financial_facts")
+        financial_facts = (
+            primary.get("financial_facts")
+            if primary else ({} if uses_receipt_schema else result.get("financial_facts"))
+        )
         if not isinstance(financial_facts, dict):
             financial_facts = {}
-        classification = result.get("classification")
+        classification = (
+            primary.get("classification")
+            if primary else ({} if uses_receipt_schema else result.get("classification"))
+        )
         if not isinstance(classification, dict):
             classification = {}
+        reasons = [str(value) for value in (result.get("reasons") or [])]
+        if primary is None and receipts:
+            reasons.append("没有可自动纳入当前审计期间的主票据")
         return {
             "request_id": str(response_payload.get("id") or "openai-vision"),
             "status": status,
-            "reasons": [str(value) for value in (result.get("reasons") or [])],
+            "reasons": reasons,
             "model": {"provider": "openai", "vision": response_model},
             "image": {
                 "filename": pages[0][1],
@@ -489,14 +614,8 @@ class OpenAIVisionClient:
                 "size_bytes": sum(len(page[0]) for page in pages),
                 "page_count": len(pages),
             },
-            "receipts": [
-                {
-                    "index": 1,
-                    "text": str(result.get("text") or ""),
-                    "lines": [],
-                    "payment_candidates": payment_candidates,
-                }
-            ],
+            "primary_receipt_index": primary.get("index") if primary else None,
+            "receipts": receipts,
             "financial_facts": financial_facts,
             "classification": classification,
             "processing_ms": round((time.perf_counter() - started) * 1000, 2),
