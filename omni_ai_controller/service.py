@@ -408,7 +408,12 @@ def create_app(
             raise HTTPException(status_code=403, detail="Only the immutable Mutsu super administrator may control the assistant")
         return account
 
-    application.include_router(control_router(active_mutsu_control, require_mutsu_super))
+    persona_marker = "你是陆奥，是"
+    _, found, legacy_persona = MUTSU_SYSTEM_PROMPT.partition(persona_marker)
+    application.include_router(control_router(
+        active_mutsu_control, require_mutsu_super,
+        default_persona=found + legacy_persona if found else "",
+    ))
 
     def permission_required(permission: str):  # type: ignore[no-untyped-def]
         def check(account: dict[str, object] = Depends(require_admin)) -> dict[str, object]:

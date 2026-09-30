@@ -99,7 +99,7 @@ def record_behavior(store: MutsuControlStore, actor: str, event: str, status: st
         LOGGER.warning("Mutsu behavior storage unavailable; event=%s", event)
 
 
-def control_router(store: MutsuControlStore, require_super: Any) -> APIRouter:
+def control_router(store: MutsuControlStore, require_super: Any, *, default_persona: str = "") -> APIRouter:
     router = APIRouter(prefix="/mutsu/control")
     key_type = Path(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
 
@@ -111,6 +111,9 @@ def control_router(store: MutsuControlStore, require_super: Any) -> APIRouter:
         try:
             data = store.settings()
             data["configuration"] = {**DEFAULT_CONFIGURATION, **data["configuration"]}
+            data["default_persona"] = default_persona
+            data["effective_persona"] = data["configuration"].get("persona") or default_persona
+            data["persona_source"] = "custom" if data["configuration"].get("persona") else "builtin"
             data["runtime_policy"] = {"tools_executable": False, "automatic_learning": False, "permissions_enforced": True}
             return data
         except MutsuControlError as exc:

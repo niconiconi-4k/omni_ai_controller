@@ -81,6 +81,25 @@ def test_super_flag_alone_is_not_enough_for_control():
         assert browser.get("/mutsu/control/settings", headers=headers()).status_code == 403
 
 
+def test_builtin_persona_is_visible_only_to_super_without_changing_stored_default():
+    from omni_ai_controller.service import MUTSU_SYSTEM_PROMPT
+
+    store = FakeMutsuStore()
+    marker = "你是陆奥，是"
+    expected = marker + MUTSU_SYSTEM_PROMPT.partition(marker)[2]
+    with client(mutsu_control_store=store) as browser:
+        settings = browser.get("/mutsu/control/settings", headers=headers()).json()
+        assert settings["persona_source"] == "builtin"
+        assert settings["configuration"]["persona"] == ""
+        assert settings["effective_persona"] == expected
+        assert settings["default_persona"] == expected
+        assert "permissions 中不存在的能力" not in settings["default_persona"]
+        conversation = browser.get("/mutsu/conversation", headers=headers()).json()
+        assert "default_persona" not in conversation
+        assert store.configuration["persona"] == ""
+        assert store.revision == 1
+
+
 def test_persona_and_avatar_save_preserve_safety_and_existing_conversation():
     store = FakeMutsuStore()
     controller = FakeController()
@@ -89,6 +108,9 @@ def test_persona_and_avatar_save_preserve_safety_and_existing_conversation():
         saved = browser.put("/mutsu/control/settings", headers=headers(), json=payload)
         assert saved.status_code == 200
         assert saved.json()["revision"] == 2
+        effective = browser.get("/mutsu/control/settings", headers=headers()).json()
+        assert effective["persona_source"] == "custom"
+        assert effective["effective_persona"] == payload["persona"]
         assert browser.put("/mutsu/control/settings", headers=headers(), json=payload).status_code == 409
         conversation = browser.get("/mutsu/conversation", headers=headers()).json()
         assert conversation["appearance"] == {"display_name": "陆奥助手", "avatar_icon": "🌙"}
@@ -102,6 +124,24 @@ def test_persona_and_avatar_save_preserve_safety_and_existing_conversation():
         events = browser.get("/mutsu/control/events", headers=headers()).json()["items"]
         assert [event["event_type"] for event in events] == ["chat.completed", "chat.started", "settings.updated"]
         assert all("查看状态" not in str(event["details"]) and payload["persona"] not in str(event["details"]) for event in events)
+
+
+def test_restore_builtin_persona_preserves_original_prompt_and_history():
+    from omni_ai_controller.service import MUTSU_SYSTEM_PROMPT
+
+    store = FakeMutsuStore()
+    store.configuration["persona"] = "自定义交流风格"
+    controller = FakeController()
+    with client(controller=controller, mutsu_control_store=store) as browser:
+        first = browser.get("/mutsu/conversation", headers=headers()).json()["conversation"]
+        restored = browser.put("/mutsu/control/settings", headers=headers(), json={"revision": 1, "persona": ""})
+        assert restored.status_code == 200
+        settings = browser.get("/mutsu/control/settings", headers=headers()).json()
+        assert settings["persona_source"] == "builtin"
+        reply = browser.post("/mutsu/messages", headers=headers(), json={"content": "你好"})
+        assert reply.status_code == 200
+        assert controller.chat_messages[0]["content"].startswith(MUTSU_SYSTEM_PROMPT)
+        assert reply.json()["conversation"]["id"] == first["id"]
 
 
 def test_registered_capability_is_never_executable_and_rejects_untrusted_fields():
