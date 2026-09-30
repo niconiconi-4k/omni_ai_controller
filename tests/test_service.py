@@ -445,6 +445,7 @@ def client(
     store: FakeAdminAccountStore | None = None,
     statement_client: FakeStatementClient | None = None,
     conversation_store: FakeConversationStore | None = None,
+    mutsu_control_store=None,
 ) -> TestClient:
     settings = ServiceSettings(
         model_dir=Path("/tmp/model"),
@@ -465,6 +466,7 @@ def client(
             FakeVisionClient(),
             statement_client,
             admin_account_store=store or FakeAdminAccountStore(),
+            mutsu_control_store=mutsu_control_store,
         ),  # type: ignore[arg-type]
         base_url="https://testserver",
     )
