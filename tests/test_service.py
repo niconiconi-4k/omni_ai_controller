@@ -741,6 +741,35 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         ]
 
 
+def test_internal_agentic_output_limit_returns_partial_result_instead_of_502() -> None:
+    controller = FakeController()
+    original_chat = controller.model_server.client.chat_json
+
+    def truncated_chat(messages, **kwargs):
+        response = original_chat(messages, **kwargs)
+        response.raw["choices"] = [{"finish_reason": "length"}]
+        return response
+
+    controller.model_server.client.chat_json = truncated_chat
+    with client(controller=controller) as test_client:
+        response = test_client.post(
+            "/internal/audit/agentic",
+            headers={"X-Vision-Token": "internal-vision-token"},
+            json={
+                "audit_id": "audit-output-limit",
+                "context": {
+                    "transactions": [{"id": "tx"}],
+                    "receipts": [{"id": "receipt"}],
+                    "deterministic_candidates": [{"transaction_id": "tx", "receipt_upload_id": "receipt"}],
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["error_code"] == "agentic_output_limit"
+        assert response.json()["result"]["decisions"] == []
+        assert len(response.json()["steps"]) == 2
+
+
 def test_internal_vision_rejects_document_total_before_forwarding(monkeypatch) -> None:
     monkeypatch.setattr(service, "MAX_VISION_DOCUMENT_BYTES", 10)
     with client() as test_client:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
+from copy import deepcopy
 import json
+from threading import Lock
+from datetime import datetime, timezone
 from typing import Any
 
 from .audit_skill import (
@@ -25,8 +28,57 @@ SEED_STRATEGY_ORDER = [
 MAX_AGENTIC_SOURCE_CHARS = 4_000_000
 MAX_PLANNER_INPUT_TOKENS = 16_000
 MAX_WORKER_CHUNK_TOKENS = 12_000
+MAX_WORKER_CHUNK_CANDIDATES = 8
 MAX_AGENT_INPUT_TOKENS = 18_000
 MAX_AGENTIC_CHUNKS = 30
+MAX_AGENT_RETRY_OUTPUT_TOKENS = 8192
+
+
+class _AgentOutputLimit(AuditSkillError):
+    """A truncated response must never be parsed or applied as a decision."""
+
+_PROGRESS_LOCK = Lock()
+_PROGRESS: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+
+def get_audit_progress(run_id: str) -> dict[str, Any]:
+    with _PROGRESS_LOCK:
+        return deepcopy(_PROGRESS.get(run_id, {}))
+
+
+def _publish_progress(run_id: str, **updates: Any) -> None:
+    with _PROGRESS_LOCK:
+        snapshot = _PROGRESS.setdefault(run_id, {})
+        snapshot.update(deepcopy(updates))
+        snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _PROGRESS.move_to_end(run_id)
+        while len(_PROGRESS) > 32:
+            _PROGRESS.popitem(last=False)
+
+
+def _agent_json(response: Any, stage: str, run_id: str) -> dict[str, Any]:
+    choices = response.raw.get("choices") or []
+    finish_reason = choices[0].get("finish_reason") if choices else None
+    _publish_progress(run_id, last_response={
+        "stage": stage,
+        "finish_reason": finish_reason,
+        "usage": _usage(response.raw),
+        "output_characters": len(response.content),
+    })
+    if finish_reason == "length":
+        raise _AgentOutputLimit(
+            f"{stage}输出被截断（finish_reason=length），不能使用不完整 JSON；请缩小任务分片"
+        )
+    try:
+        result = json.loads(response.content)
+    except json.JSONDecodeError as exc:
+        raise AuditSkillError(
+            f"{stage}返回格式无效：JSON 在字符 {exc.pos} 处解析失败；"
+            f"finish_reason={finish_reason or 'unknown'}，输出字符数={len(response.content)}"
+        ) from exc
+    if not isinstance(result, dict):
+        raise AuditSkillError(f"{stage}返回格式无效：结果不是 JSON 对象")
+    return result
 
 _PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -300,7 +352,10 @@ def _worker_chunks(context: dict[str, Any]) -> list[dict[str, Any]]:
     pending: list[dict[str, Any]] = []
     for group in groups.values():
         proposed = build([*pending, *group])
-        if pending and _estimated_tokens(_serialized(proposed)) > MAX_WORKER_CHUNK_TOKENS:
+        if pending and (
+            _estimated_tokens(_serialized(proposed)) > MAX_WORKER_CHUNK_TOKENS
+            or len(pending) + len(group) > MAX_WORKER_CHUNK_CANDIDATES
+        ):
             chunks.append(build(pending))
             pending = list(group)
         else:
@@ -331,7 +386,121 @@ def _combined_usage(steps: list[dict[str, Any]]) -> dict[str, int]:
     return combined
 
 
-def analyze_agentic_audit(
+def _bounded_output_schema(schema: dict[str, Any], decision_count: int) -> dict[str, Any]:
+    """Bound free-form text without changing the shared legacy audit schema."""
+    bounded = deepcopy(schema)
+
+    def visit(node: dict[str, Any]) -> None:
+        if node.get("type") == "string" and "enum" not in node:
+            node.setdefault("maxLength", 320)
+        if node.get("type") == "array":
+            node.setdefault("maxItems", 8)
+            if node.get("items", {}).get("type") == "string":
+                node["maxItems"] = min(node["maxItems"], 6)
+        for name, child in node.get("properties", {}).items():
+            if name == "decisions":
+                child["maxItems"] = min(child["maxItems"], max(1, decision_count))
+            visit(child)
+        if isinstance(node.get("items"), dict):
+            visit(node["items"])
+
+    visit(bounded)
+    return bounded
+
+
+def _request_agent(
+    client: ModelServerClient,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    schema_name: str,
+    schema: dict[str, Any],
+    max_tokens: int,
+    stage: str,
+    step_kind: str,
+    run_id: str,
+    steps: list[dict[str, Any]],
+    decision_count: int = 1,
+    attempts: int = 2,
+) -> tuple[Any, dict[str, Any]]:
+    bounded_schema = _bounded_output_schema(schema, decision_count)
+    for attempt in range(attempts):
+        output_budget = max_tokens if attempt == 0 else min(max_tokens * 2, MAX_AGENT_RETRY_OUTPUT_TOKENS)
+        compact_instruction = (
+            "\n输出须简洁：不要复述输入或展开推理过程；只填写必要证据和结论，"
+            "同一关系不要重复输出，遵守 Schema 的字符串长度与数组条数上限。"
+        )
+        if attempt:
+            compact_instruction += "上次输出达到 token 上限；本次进一步压缩文字，必须完整闭合 JSON。"
+        _ensure_input_budget(
+            system_prompt + compact_instruction, user_prompt,
+            MAX_PLANNER_INPUT_TOKENS if step_kind == "initial_plan" else MAX_AGENT_INPUT_TOKENS,
+        )
+        response = client.chat_json(
+            [
+                {"role": "system", "content": system_prompt + compact_instruction},
+                {"role": "user", "content": user_prompt},
+            ],
+            schema_name=schema_name,
+            schema=bounded_schema,
+            max_tokens=output_budget,
+        )
+        try:
+            result = _agent_json(response, stage, run_id)
+        except _AgentOutputLimit as exc:
+            snapshot = get_audit_progress(run_id)
+            steps.append({
+                "sequence_number": len(steps) + 1,
+                "agent_kind": "evidence_worker" if step_kind == "evidence_review" else "audit_planner",
+                "step_kind": step_kind,
+                "status": "failed",
+                "model": client.config.model_name,
+                "request_id": str(response.raw.get("id") or "") or None,
+                "result": {},
+                "usage": _usage(response.raw),
+                "input_summary": {
+                    "attempt": attempt + 1,
+                    "max_tokens": output_budget,
+                    "finish_reason": "length",
+                    "candidate_count": decision_count,
+                    "batch": snapshot.get("batch"),
+                    "batch_count": snapshot.get("batch_count"),
+                },
+                "error_code": "agentic_output_limit",
+                "error_message": str(exc),
+            })
+            _publish_progress(run_id, steps=steps, usage=_combined_usage(steps), recovery="retry_or_split")
+            if attempt + 1 == attempts:
+                raise
+        else:
+            _publish_progress(run_id, recovery=None)
+            return response, result
+    raise AssertionError("Unreachable retry state")
+
+
+def _split_worker_chunk(chunk: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split only between transactions: reimbursement groups stay complete."""
+    transaction_ids = list(dict.fromkeys(
+        str(item.get("transaction_id") or "")
+        for item in chunk["deterministic_candidates"]
+    ))
+    if len(transaction_ids) < 2:
+        return []
+    midpoint = len(transaction_ids) // 2
+    children = []
+    for ids in (set(transaction_ids[:midpoint]), set(transaction_ids[midpoint:])):
+        candidates = [item for item in chunk["deterministic_candidates"] if str(item.get("transaction_id") or "") in ids]
+        receipt_ids = {str(item.get("receipt_upload_id") or "") for item in candidates}
+        children.append({
+            **chunk,
+            "transactions": [item for item in chunk["transactions"] if str(item.get("id")) in ids],
+            "receipts": [item for item in chunk["receipts"] if str(item.get("id")) in receipt_ids],
+            "deterministic_candidates": candidates,
+        })
+    return children
+
+
+def _analyze_agentic_audit(
     client: ModelServerClient,
     *,
     audit_id: str,
@@ -354,20 +523,34 @@ def analyze_agentic_audit(
         raise AuditSkillError("马师傅没有收到可执行的确定性候选")
     steps: list[dict[str, Any]] = []
     final_results: list[dict[str, Any]] = []
+    incomplete_batches: list[str] = []
+    run_id = str(context.get("_run_id") or audit_id)
+    _publish_progress(run_id, batch_count=len(chunks), candidate_count=len(context.get("deterministic_candidates") or []))
+
+    def recover_chunk(chunk: dict[str, Any], index: int, error: _AgentOutputLimit) -> bool:
+        children = _split_worker_chunk(chunk)
+        if children and len(chunks) < MAX_AGENTIC_CHUNKS:
+            chunks[index - 1:index] = children
+            _publish_progress(run_id, batch_count=len(chunks), recovery="split_by_transaction")
+            return True
+        incomplete_batches.append(f"分片 {index}：{error}；保留确定性候选，需人工复核")
+        _publish_progress(run_id, incomplete_batches=incomplete_batches, recovery="manual_review")
+        return False
+
     try:
         with AUDIT_SKILL_LOCK:
-            plan_response = client.chat_json(
-                [
-                    {"role": "system", "content": _PLANNER_SYSTEM_PROMPT},
-                    {"role": "user", "content": planner_user_prompt},
-                ],
+            _publish_progress(run_id, stage="initial_plan", agent_kind="audit_planner")
+            plan_response, plan = _request_agent(
+                client,
+                system_prompt=_PLANNER_SYSTEM_PROMPT,
+                user_prompt=planner_user_prompt,
                 schema_name="li_shifu_audit_plan",
                 schema=_PLAN_SCHEMA,
                 max_tokens=3072,
+                stage="李师傅制定计划", step_kind="initial_plan", run_id=run_id, steps=steps,
             )
-            plan = json.loads(plan_response.content)
             steps.append({
-                "sequence_number": 1,
+                "sequence_number": len(steps) + 1,
                 "agent_kind": "audit_planner",
                 "step_kind": "initial_plan",
                 "status": "completed",
@@ -376,8 +559,12 @@ def analyze_agentic_audit(
                 "result": plan,
                 "usage": _usage(plan_response.raw),
             })
+            _publish_progress(run_id, steps=steps, usage=_combined_usage(steps))
 
-            for batch_index, chunk in enumerate(chunks, start=1):
+            batch_index = 1
+            while batch_index <= len(chunks):
+                chunk = chunks[batch_index - 1]
+                _publish_progress(run_id, stage="evidence_review", agent_kind="evidence_worker", batch=batch_index)
                 worker_document = _serialized(chunk)
                 worker_user_prompt = (
                     f"审计编号：{audit_id}\n任务分片：{batch_index}/{len(chunks)}"
@@ -387,16 +574,23 @@ def analyze_agentic_audit(
                 _ensure_input_budget(
                     _WORKER_SYSTEM_PROMPT, worker_user_prompt, MAX_AGENT_INPUT_TOKENS
                 )
-                worker_response = client.chat_json(
-                    [
-                        {"role": "system", "content": _WORKER_SYSTEM_PROMPT},
-                        {"role": "user", "content": worker_user_prompt},
-                    ],
-                    schema_name="ma_shifu_evidence_review",
-                    schema=_WORKER_SCHEMA,
-                    max_tokens=6144,
-                )
-                worker = json.loads(worker_response.content)
+                multi_transaction = len({item.get("transaction_id") for item in chunk["deterministic_candidates"]}) > 1
+                try:
+                    worker_response, worker = _request_agent(
+                        client,
+                        system_prompt=_WORKER_SYSTEM_PROMPT,
+                        user_prompt=worker_user_prompt,
+                        schema_name="ma_shifu_evidence_review",
+                        schema=_WORKER_SCHEMA,
+                        max_tokens=6144,
+                        stage="马师傅证据核对", step_kind="evidence_review", run_id=run_id, steps=steps,
+                        decision_count=len(chunk["deterministic_candidates"]),
+                        attempts=1 if multi_transaction else 2,
+                    )
+                except _AgentOutputLimit as exc:
+                    if not recover_chunk(chunk, batch_index, exc):
+                        batch_index += 1
+                    continue
                 steps.append({
                     "sequence_number": len(steps) + 1,
                     "agent_kind": "evidence_worker",
@@ -413,6 +607,7 @@ def analyze_agentic_audit(
                         "candidate_count": len(chunk["deterministic_candidates"]),
                     },
                 })
+                _publish_progress(run_id, steps=steps, usage=_combined_usage(steps))
 
                 final_input = {
                     "summary": summary,
@@ -427,16 +622,23 @@ def analyze_agentic_audit(
                 _ensure_input_budget(
                     _FINAL_SYSTEM_PROMPT, final_user_prompt, MAX_AGENT_INPUT_TOKENS
                 )
-                final_response = client.chat_json(
-                    [
-                        {"role": "system", "content": _FINAL_SYSTEM_PROMPT},
-                        {"role": "user", "content": final_user_prompt},
-                    ],
-                    schema_name="li_shifu_final_assessment",
-                    schema=_FINAL_SCHEMA,
-                    max_tokens=6144,
-                )
-                final = json.loads(final_response.content)
+                _publish_progress(run_id, stage="final_assessment", agent_kind="audit_planner")
+                try:
+                    final_response, final = _request_agent(
+                        client,
+                        system_prompt=_FINAL_SYSTEM_PROMPT,
+                        user_prompt=final_user_prompt,
+                        schema_name="li_shifu_final_assessment",
+                        schema=_FINAL_SCHEMA,
+                        max_tokens=6144,
+                        stage="李师傅最终评估", step_kind="final_assessment", run_id=run_id, steps=steps,
+                        decision_count=len(chunk["deterministic_candidates"]),
+                        attempts=1 if multi_transaction else 2,
+                    )
+                except _AgentOutputLimit as exc:
+                    if not recover_chunk(chunk, batch_index, exc):
+                        batch_index += 1
+                    continue
                 final_results.append(final)
                 steps.append({
                     "sequence_number": len(steps) + 1,
@@ -449,6 +651,8 @@ def analyze_agentic_audit(
                     "usage": _usage(final_response.raw),
                     "input_summary": {"batch": batch_index, "batch_count": len(chunks)},
                 })
+                _publish_progress(run_id, steps=steps, usage=_combined_usage(steps))
+                batch_index += 1
     except (ConfigurationError, ServerRequestError, json.JSONDecodeError) as exc:
         raise AuditSkillError("李师傅或马师傅不可用，或返回格式无效") from exc
     if not all(isinstance(item, dict) and isinstance(item.get("decisions"), list) for item in final_results):
@@ -458,6 +662,7 @@ def analyze_agentic_audit(
         for item in final_results
         for value in (item.get("risks") or [])
     ))
+    risks.extend(incomplete_batches)
     skill_candidates: list[dict[str, Any]] = []
     seen_skills: set[tuple[str, str]] = set()
     for item in final_results:
@@ -475,7 +680,7 @@ def analyze_agentic_audit(
             for item in final_results
             for decision in (item.get("decisions") or [])
         ],
-        "summary": f"李师傅完成 {len(chunks)} 个证据分片评估。" + "；".join(
+        "summary": f"李师傅完成 {len(final_results)}/{len(chunks)} 个证据分片评估。" + "；".join(
             str(item.get("summary") or "") for item in final_results if item.get("summary")
         ),
         "risks": risks,
@@ -496,4 +701,51 @@ def analyze_agentic_audit(
         "seed_playbook": SEED_PLAYBOOK_ID,
         "worker_batch_count": len(chunks),
         "steps": steps,
+        **({
+            "error_code": "agentic_output_limit",
+            "error_message": "部分分片在拆分或有限重试后仍被截断，未应用这些分片的模型决策；需人工复核",
+        } if incomplete_batches else {}),
     }
+
+
+def analyze_agentic_audit(
+    client: ModelServerClient,
+    *,
+    audit_id: str,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    run_id = str(context.get("_run_id") or audit_id)
+    _publish_progress(run_id, status="processing", stage="preparing", steps=[], usage={}, error_message=None, last_response={}, recovery=None, incomplete_batches=[], batch=None, batch_count=0)
+    try:
+        result = _analyze_agentic_audit(client, audit_id=audit_id, context=context)
+    except _AgentOutputLimit as exc:
+        # Only an exhausted initial-plan retry reaches here. No worker decision
+        # exists, so retain deterministic proposals and report a partial run.
+        snapshot = get_audit_progress(run_id)
+        result = {
+            "request_id": None,
+            "model": client.config.model_name,
+            "process_mode": "agentic",
+            "seed_playbook": SEED_PLAYBOOK_ID,
+            "serialized": True,
+            "context_characters": len(_serialized(context)),
+            "worker_batch_count": snapshot.get("batch_count", 0),
+            "steps": snapshot.get("steps") or [],
+            "usage": snapshot.get("usage") or {},
+            "result": {
+                "decisions": [], "summary": "初始计划输出被截断，本轮保留确定性候选，需人工复核。",
+                "risks": [str(exc)], "plan_assessment": "计划未完成", "skill_candidates": [],
+            },
+            "error_code": "agentic_output_limit",
+            "error_message": str(exc),
+        }
+    except (AuditSkillError, ConfigurationError, ServerRequestError) as exc:
+        _publish_progress(run_id, status="failed", error_message=str(exc))
+        raise
+    _publish_progress(run_id, status="partial" if result.get("error_code") else "completed", stage="completed", error_message=result.get("error_message"))
+    snapshot = get_audit_progress(run_id)
+    result["progress"] = {
+        key: snapshot.get(key)
+        for key in ("stage", "agent_kind", "batch", "batch_count", "candidate_count", "last_response", "recovery")
+    }
+    return result

@@ -7,13 +7,16 @@ from omni_ai_controller.agentic_audit import (
     MAX_AGENTIC_SOURCE_CHARS,
     SEED_PLAYBOOK_ID,
     analyze_agentic_audit,
+    get_audit_progress,
+    _worker_chunks,
 )
 from omni_ai_controller.audit_skill import AuditSkillError
 
 
 class FakeClient:
-    def __init__(self, responses: list[dict[str, object] | str]) -> None:
+    def __init__(self, responses: list[dict[str, object] | str], *, length_calls: set[int] | None = None) -> None:
         self.responses = list(responses)
+        self.length_calls = length_calls or set()
         self.config = SimpleNamespace(model_name="local-qwen")
         self.calls: list[dict[str, object]] = []
 
@@ -26,6 +29,7 @@ class FakeClient:
             content=content,
             raw={
                 "id": f"agent-step-{index}",
+                "choices": [{"finish_reason": "length" if index in self.length_calls else "stop"}],
                 "usage": {
                     "prompt_tokens": 100 * index,
                     "completion_tokens": 10 * index,
@@ -114,6 +118,9 @@ def test_agentic_audit_runs_li_ma_li_with_shared_seed_playbook() -> None:
     assert result["usage"]["total_tokens"] == 660
     assert "accounting-expense-first-v1" in client.calls[0]["messages"][0]["content"]
     assert "马师傅" in client.calls[1]["messages"][0]["content"]
+    snapshot = get_audit_progress("case-1")
+    assert snapshot["status"] == "completed"
+    assert len(snapshot["steps"]) == 3
 
 
 def test_agentic_audit_rejects_oversized_context_before_any_call() -> None:
@@ -178,3 +185,152 @@ def test_agentic_audit_splits_large_evidence_by_transaction() -> None:
     assert [call["schema_name"] for call in client.calls].count(
         "ma_shifu_evidence_review"
     ) == 2
+
+
+def test_agentic_failure_preserves_completed_plan_and_failure_stage() -> None:
+    client = FakeClient([_plan(), "not-json"])
+    context = {
+        "_run_id": "failed-run",
+        "transactions": [{"id": "tx"}],
+        "receipts": [{"id": "receipt"}],
+        "deterministic_candidates": [{"transaction_id": "tx", "receipt_upload_id": "receipt"}],
+    }
+    with pytest.raises(AuditSkillError, match="JSON 在字符"):
+        analyze_agentic_audit(client, audit_id="audit", context=context)
+    progress = get_audit_progress("failed-run")
+    assert progress["status"] == "failed"
+    assert progress["stage"] == "evidence_review"
+    assert len(progress["steps"]) == 1
+    assert progress["steps"][0]["result"]["objective"] == _plan()["objective"]
+    assert progress["last_response"]["output_characters"] == 8
+
+
+def test_agentic_rejects_length_finish_reason_even_for_valid_json() -> None:
+    client = FakeClient([_plan(), _plan()], length_calls={1, 2})
+    result = analyze_agentic_audit(client, audit_id="truncated", context=_small_context())
+    assert result["error_code"] == "agentic_output_limit"
+    assert result["result"]["decisions"] == []
+    assert len(client.calls) == 2
+    assert all(step["status"] == "failed" for step in result["steps"])
+    assert get_audit_progress("truncated")["status"] == "partial"
+
+
+def test_worker_chunks_limit_output_candidates_without_splitting_transaction() -> None:
+    context = {
+        "transactions": [{"id": f"tx-{i}"} for i in range(10)],
+        "receipts": [{"id": f"receipt-{i}"} for i in range(10)],
+        "deterministic_candidates": [
+            {"transaction_id": f"tx-{i}", "receipt_upload_id": f"receipt-{i}"}
+            for i in range(10)
+        ],
+    }
+    chunks = _worker_chunks(context)
+    assert [len(chunk["deterministic_candidates"]) for chunk in chunks] == [8, 2]
+
+
+def _small_context() -> dict:
+    return {
+        "transactions": [{"id": "tx"}],
+        "receipts": [{"id": "receipt"}],
+        "deterministic_candidates": [{"transaction_id": "tx", "receipt_upload_id": "receipt"}],
+    }
+
+
+def _grouped_context() -> dict:
+    return {
+        "transactions": [{"id": "tx-1"}, {"id": "tx-2"}],
+        "receipts": [{"id": f"receipt-{index}"} for index in range(3)],
+        "deterministic_candidates": [
+            {"transaction_id": "tx-1", "receipt_upload_id": "receipt-0"},
+            {"transaction_id": "tx-1", "receipt_upload_id": "receipt-1"},
+            {"transaction_id": "tx-2", "receipt_upload_id": "receipt-2"},
+        ],
+    }
+
+
+def test_truncated_plan_retries_with_bounded_output_and_tracks_all_usage() -> None:
+    client = FakeClient([_plan(), _plan(), _worker(), _final()], length_calls={1})
+    result = analyze_agentic_audit(client, audit_id="plan-retry", context=_small_context())
+    assert "error_code" not in result
+    assert client.calls[1]["max_tokens"] > client.calls[0]["max_tokens"]
+    assert result["steps"][0]["status"] == "failed"
+    assert result["usage"]["total_tokens"] == 1100
+    assert [step["sequence_number"] for step in result["steps"]] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("stage", ["worker", "final"])
+def test_truncated_single_transaction_retries_once(stage: str) -> None:
+    responses = (
+        [_plan(), _worker(), _worker(), _final()] if stage == "worker"
+        else [_plan(), _worker(), _final(), _final()]
+    )
+    client = FakeClient(responses, length_calls={2 if stage == "worker" else 3})
+    result = analyze_agentic_audit(client, audit_id=f"{stage}-retry", context=_small_context())
+    assert "error_code" not in result
+    retry_index = 2 if stage == "worker" else 3
+    assert client.calls[retry_index]["max_tokens"] == 8192
+    assert len(client.calls) == 4
+    assert get_audit_progress(f"{stage}-retry")["status"] == "completed"
+
+
+@pytest.mark.parametrize("stage", ["worker", "final"])
+def test_truncated_batch_splits_only_between_transactions(stage: str) -> None:
+    responses = [_plan()]
+    if stage == "final":
+        responses.append(_worker())
+    responses += ["{truncated", _worker(), _final(), _worker(), _final()]
+    client = FakeClient(responses, length_calls={2 if stage == "worker" else 3})
+    result = analyze_agentic_audit(client, audit_id=f"{stage}-split", context=_grouped_context())
+    assert "error_code" not in result
+    assert result["worker_batch_count"] == 2
+    completed_workers = [
+        step for step in result["steps"]
+        if step["step_kind"] == "evidence_review" and step["status"] == "completed"
+    ]
+    assert [step["input_summary"]["candidate_count"] for step in completed_workers[-2:]] == [2, 1]
+    assert [call["schema"]["properties"]["decisions"]["maxItems"] for call in client.calls if call["schema_name"] == "ma_shifu_evidence_review"][-2:] == [2, 1]
+
+
+def test_failed_single_group_does_not_discard_other_approved_batches(monkeypatch) -> None:
+    monkeypatch.setattr("omni_ai_controller.agentic_audit.MAX_WORKER_CHUNK_CANDIDATES", 1)
+    approved = {**_final(), "decisions": [{"transaction_id": "tx-1", "recommendation": "suggest"}]}
+    client = FakeClient([_plan(), _worker(), approved, "{truncated", "{truncated"], length_calls={4, 5})
+    result = analyze_agentic_audit(client, audit_id="partial-batches", context=_grouped_context())
+    assert result["error_code"] == "agentic_output_limit"
+    assert result["result"]["decisions"] == approved["decisions"]
+    assert result["result"]["risks"]
+    assert len(client.calls) == 5
+    assert result["usage"]["total_tokens"] == 1650
+    assert get_audit_progress("partial-batches")["status"] == "partial"
+
+
+def test_agentic_output_bounds_do_not_mutate_shared_legacy_schema() -> None:
+    from omni_ai_controller.agentic_audit import _WORKER_SCHEMA
+    from omni_ai_controller.audit_skill import AUDIT_DECISIONS_SCHEMA
+
+    client = FakeClient([_plan(), _worker(), _final()])
+    analyze_agentic_audit(client, audit_id="schema-bounds", context=_small_context())
+    schema = client.calls[1]["schema"]
+    assert schema["properties"]["summary"]["maxLength"] == 320
+    assert schema["properties"]["decisions"]["maxItems"] == 1
+    assert "maxLength" not in _WORKER_SCHEMA["properties"]["summary"]
+    assert AUDIT_DECISIONS_SCHEMA["maxItems"] == 200
+
+
+def test_exhausted_final_retry_never_applies_unapproved_worker_decisions() -> None:
+    worker = {**_worker(), "decisions": [{"transaction_id": "tx", "recommendation": "match"}]}
+    client = FakeClient([_plan(), worker, _final(), _final()], length_calls={3, 4})
+    result = analyze_agentic_audit(client, audit_id="unapproved", context=_small_context())
+    assert result["result"]["decisions"] == []
+    assert result["error_code"] == "agentic_output_limit"
+    assert len(client.calls) == 4
+
+
+def test_split_budget_exhaustion_is_partial_not_an_unbounded_loop(monkeypatch) -> None:
+    monkeypatch.setattr("omni_ai_controller.agentic_audit.MAX_AGENTIC_CHUNKS", 1)
+    client = FakeClient([_plan(), "{truncated"], length_calls={2})
+    result = analyze_agentic_audit(client, audit_id="split-limit", context=_grouped_context())
+    assert result["error_code"] == "agentic_output_limit"
+    assert result["worker_batch_count"] == 1
+    assert result["result"]["decisions"] == []
+    assert len(client.calls) == 2

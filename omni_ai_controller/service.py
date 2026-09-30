@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, SecretStr
 
 from .admin import AdminCommandError, AdminController
-from .agentic_audit import analyze_agentic_audit
+from .agentic_audit import analyze_agentic_audit, get_audit_progress
 from .audit_skill import AuditSkillError, analyze_audit
 from .bank_statement import (
     MAX_STATEMENT_PAGES,
@@ -883,6 +883,10 @@ def create_app(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=str(exc),
             ) from exc
+
+    @application.get("/internal/audit/progress/{run_id}", dependencies=[vision_internal])
+    def audit_progress(run_id: str) -> dict[str, Any]:
+        return get_audit_progress(run_id)
 
     @application.post("/internal/audit/agentic", dependencies=[vision_internal])
     def reconcile_audit_with_li_and_ma(
