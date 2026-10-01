@@ -26,6 +26,15 @@ class FakeResponse:
         return self.payload
 
 
+def test_unconfigured_vision_defaults_to_gpt6_without_overwriting_explicit_model(tmp_path):
+    store = VisionSettingsStore(tmp_path / "vision.json")
+    status = store.status()
+    assert status["model"] == "gpt-6-sol"
+    assert [item["id"] for item in status["models"] if item["default"]] == ["gpt-6-sol"]
+    store.save(model="gpt-4.1", api_key="sk-test-012345678901234567890")
+    assert store.status()["model"] == "gpt-4.1"
+
+
 def test_settings_store_never_returns_key_and_uses_private_mode(tmp_path: Path) -> None:
     path = tmp_path / "openai-vision.json"
     store = VisionSettingsStore(path)

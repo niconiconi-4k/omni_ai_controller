@@ -15,7 +15,7 @@ SUPPORTED_VISION_MODELS: dict[str, dict[str, object]] = {
     "gpt-4o": {
         "label": "GPT-4o",
         "description": "成熟的多模态识图模型，128K 上下文",
-        "default": True,
+        "default": False,
     },
     "gpt-4.1": {
         "label": "GPT-4.1",
@@ -25,10 +25,10 @@ SUPPORTED_VISION_MODELS: dict[str, dict[str, object]] = {
     "gpt-6-sol": {
         "label": "GPT-6 Sol",
         "description": "适合复杂凭证与银行流水识别，约 1M 上下文",
-        "default": False,
+        "default": True,
     },
 }
-DEFAULT_VISION_MODEL = "gpt-4o"
+DEFAULT_VISION_MODEL = "gpt-6-sol"
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 MAX_VISION_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_VISION_DOCUMENT_BYTES = 32 * 1024 * 1024
