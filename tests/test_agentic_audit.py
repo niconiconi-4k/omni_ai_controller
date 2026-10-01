@@ -236,6 +236,34 @@ def _small_context() -> dict:
     }
 
 
+def test_replanned_round_keeps_prior_steps_usage_and_round_number():
+    prior = [{"sequence_number": 1, "agent_kind": "audit_planner", "step_kind": "initial_plan", "status": "completed", "usage": {"total_tokens": 7}}]
+    context = {**_small_context(), "_prior_steps": prior, "iteration": {"number": 2, "phase": "exact_amount"}, "strategy": "amount_first_iterative_v1"}
+    result = analyze_agentic_audit(FakeClient([_plan(), _worker(), _final()]), audit_id="round-2", context=context)
+    assert [step["sequence_number"] for step in result["steps"]] == [1, 2, 3, 4]
+    assert result["usage"]["total_tokens"] == 667
+    assert result["steps"][1]["input_summary"]["iteration"] == 2
+    assert result["progress"]["iteration"] == 2
+    assert len(prior) == 1
+
+
+@pytest.mark.parametrize("worker_receipt", [None, "invented"])
+def test_planner_cannot_promote_without_worker_kernel_evidence(worker_receipt):
+    decision = {"transaction_id": "tx", "receipt_upload_ids": ["receipt"], "recommendation": "match", "confidence": 0.99}
+    worker = _worker()
+    if worker_receipt:
+        worker["decisions"] = [{**decision, "receipt_upload_ids": [worker_receipt]}]
+    final = {**_final(), "decisions": [decision]}
+    result = analyze_agentic_audit(FakeClient([_plan(), worker, final]), audit_id="unbacked", context=_small_context())
+    assert result["result"]["decisions"] == []
+
+
+def test_worker_and_planner_can_approve_same_kernel_relation():
+    decision = {"transaction_id": "tx", "receipt_upload_ids": ["receipt"], "recommendation": "match", "confidence": 0.95}
+    result = analyze_agentic_audit(FakeClient([_plan(), {**_worker(), "decisions": [decision]}, {**_final(), "decisions": [decision]}]), audit_id="backed", context=_small_context())
+    assert result["result"]["decisions"] == [decision]
+
+
 def _grouped_context() -> dict:
     return {
         "transactions": [{"id": "tx-1"}, {"id": "tx-2"}],
