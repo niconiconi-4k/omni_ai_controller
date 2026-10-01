@@ -49,6 +49,7 @@ CLASSIFICATION_SYSTEM_PROMPT = """你是财务凭证粗分类器。输入内容�
 5. lönespecifikation、lönebesked、arbetsgivardeklaration/AGI 属于 payroll_voucher；贷款、利息、融资文件属于 loan_interest_voucher；momsdeklaration、税务申报、海关或进口 VAT 文件属于 tax_voucher。
 6. 判断交易方向时，优先参考 Säljare、Köpare、Kund、Leverantör、Fakturamottagare、subject_company_name、公司名称、组织号、付款信息，以及 payer/payee 和文件正文。不得仅根据关键词分类，不得因为出现 faktura 或 kreditfaktura 就默认收入。
 7. subject_company_name 是服务端提供的可选方向判定上下文。若为空、过于笼统或与单据主体无法可靠对应，不得凭空假设本公司是销售方，但这不等同于凭证自身无法分类。
+8. 日期必须按角色理解：document_date_iso 是开票/创建日，due_date_iso 是付款截止日，不是实际交易时间。transaction_time_role 区分实际支付、销售活动、结算和未知；POS 日报的销售日期不等于银行到账日期。amount_components 中卡、现金、Swish、手续费和结算金额是单据上明确的分项，不能把总销售额当成某一个渠道的净入账。
 
 禁止输出 bank_voucher 或 uncategorized。只有分类和交易方向证据均明确且 confidence >= 0.85 时，才设置 is_certain=true 并给出五类之一；否则 document_type=null、is_certain=false。不要根据金额正负号单独判断收入或支出，不要猜测不可见信息。reason 必须简洁说明交易方向和单据类型；evidence 只引用输入中真实存在的主体、角色标签、组织号或字段。只返回符合 JSON Schema 的对象。"""
 

@@ -104,12 +104,29 @@ FINANCIAL_FACTS_SCHEMA: dict[str, Any] = {
         "account_numbers": {"type": "array", "items": {"type": "string"}},
         "transaction_time_text": {"type": ["string", "null"]},
         "transaction_time_iso": {"type": ["string", "null"]},
+        "transaction_time_role": {"type": "string", "enum": ["actual_payment", "sales_activity", "settlement", "unknown"]},
+        "document_kind": {"type": "string", "enum": ["receipt", "invoice", "sales_report", "settlement", "payroll", "tax", "unknown"]},
+        "document_date_iso": {"type": ["string", "null"]},
+        "due_date_iso": {"type": ["string", "null"]},
+        "amount_components": {
+            "type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "role": {"type": "string", "enum": ["total", "card", "cash", "swish", "fee", "settlement", "other"]},
+                    "amount_decimal": {"type": "string"},
+                    "label": {"type": "string"},
+                    "currency": {"type": ["string", "null"]},
+                },
+                "required": ["role", "amount_decimal", "label", "currency"],
+            },
+        },
         "payer": PARTY_SCHEMA,
         "payee": PARTY_SCHEMA,
     },
     "required": [
         "amount_text", "amount_decimal", "amount_effect", "currency", "reference_numbers",
         "account_numbers", "transaction_time_text", "transaction_time_iso",
+        "transaction_time_role", "document_kind", "document_date_iso", "due_date_iso", "amount_components",
         "payer", "payee",
     ],
 }
@@ -377,6 +394,16 @@ class OpenAIVisionClient:
                     "receipt. Set relevance=unassessed and "
                     "relevance_reason='deferred_to_audit' for every financial receipt. Do not decide audit-period, "
                     "company-ownership or duplicate relevance during recognition. "
+                    "Record document_kind explicitly. An invoice issue date is document_date_iso, "
+                    "its payment deadline is due_date_iso: neither is an actual transaction_time_iso. "
+                    "Use transaction_time_role=actual_payment only for evidence of actual payment; "
+                    "use sales_activity for a POS/day report and settlement for a processor settlement. "
+                    "Unknown date roles must remain unknown, not guessed. Preserve document and due dates "
+                    "both on the receipt and in financial_facts. For revenue reports extract explicitly "
+                    "labelled card, cash, Swish, fee and net-settlement amounts into amount_components; "
+                    "keep the full receipt total as amount_decimal. Never invent a fee or mix unrelated "
+                    "totals. Include sales day/period and labelled payment breakdown in the short receipt "
+                    "text even when payment_candidates is capped at three. "
                     "Do not transcribe advertisements, "
                     "terms, policies, explanatory prose, or full transaction tables. "
                     + (
@@ -577,6 +604,7 @@ class OpenAIVisionClient:
             except (TypeError, ValueError, OverflowError):
                 page_start = page_end = 1
             receipt_facts = raw_receipt.get("financial_facts")
+            receipt_facts = receipt_facts if isinstance(receipt_facts, dict) else {}
             receipt_classification = raw_receipt.get("classification")
             normalized_receipt = {
                 "index": index,
@@ -585,9 +613,9 @@ class OpenAIVisionClient:
                 "relevance": "unassessed",
                 "relevance_reason": "deferred_to_audit",
                 "document_date_text": raw_receipt.get("document_date_text"),
-                "document_date_iso": raw_receipt.get("document_date_iso"),
+                "document_date_iso": raw_receipt.get("document_date_iso") or receipt_facts.get("document_date_iso"),
                 "due_date_text": raw_receipt.get("due_date_text"),
-                "due_date_iso": raw_receipt.get("due_date_iso"),
+                "due_date_iso": raw_receipt.get("due_date_iso") or receipt_facts.get("due_date_iso"),
                 "text": str(raw_receipt.get("text") or "")[:500],
                 "lines": [],
                 "payment_candidates": normalize_candidates(
