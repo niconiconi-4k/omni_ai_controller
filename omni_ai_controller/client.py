@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from time import monotonic
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -11,6 +12,14 @@ from .config import ServerConfig
 
 class ServerRequestError(RuntimeError):
     """Raised when the model server cannot satisfy a request."""
+
+
+class ServerRequestTimeout(ServerRequestError):
+    """A bounded model computation exceeded its time budget."""
+
+
+class ServerRequestCancelled(ServerRequestError):
+    """The parent audit stopped; never keep consuming GPU for it."""
 
 
 @dataclass(frozen=True)
@@ -100,12 +109,15 @@ class ModelServerClient:
         schema_name: str,
         schema: dict[str, Any],
         max_tokens: int = 768,
+        timeout: float = 3600,
+        stream: bool = False,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ChatResult:
         self.config.require_credentials()
         payload = {
             "model": self.config.model_name,
             "messages": messages,
-            "stream": False,
+            "stream": stream,
             "temperature": 0,
             "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -118,12 +130,15 @@ class ModelServerClient:
                 },
             },
         }
-        data = self._request(
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        data = (self._request_stream if stream else self._request)(
             "POST",
             "/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.config.api_key}"},
             payload=payload,
-            timeout=3600,
+            timeout=timeout,
+            **({"cancelled": cancelled} if stream else {}),
         )
         try:
             message = data["choices"][0]["message"]
@@ -132,6 +147,79 @@ class ModelServerClient:
         content = message.get("content") or ""
         reasoning = message.get("reasoning_content") or ""
         return ChatResult(str(content), str(reasoning), data)
+
+    def _request_stream(
+        self, method: str, path: str, *, headers: dict[str, str],
+        payload: dict[str, Any], timeout: float,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Keep the upstream response cancellable, with a total wall-clock budget.
+
+        Streaming headers reach the gateway immediately. Closing this response
+        also closes its upstream vLLM stream instead of abandoning a non-stream
+        request that is still waiting for its first HTTP response.
+        """
+        request = Request(
+            f"{self.config.base_url}{path}", method=method,
+            headers={"Accept": "text/event-stream", "Content-Type": "application/json", **headers},
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        )
+        deadline = monotonic() + timeout
+        content: list[str] = []
+        reasoning: list[str] = []
+        raw: dict[str, Any] = {}
+        finish_reason = None
+        completed = False
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                while True:
+                    if cancelled is not None and cancelled():
+                        raise ServerRequestCancelled("上层审核已结束等待；关闭当前模型流，不再提交后续分片")
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("智能审计单步计算达到时间预算")
+                    # urllib timeouts are per read: constrain each socket read
+                    # to the remaining total wall-clock budget as well.
+                    socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                    if socket is not None:
+                        socket.settimeout(remaining)
+                    line = response.readline()
+                    if not line:
+                        break
+                    if not line.startswith(b"data:"):
+                        continue
+                    event = line[5:].strip()
+                    if event == b"[DONE]":
+                        completed = True
+                        break
+                    chunk = json.loads(event)
+                    if chunk.get("error"):
+                        raise ServerRequestError("模型流式响应报告错误")
+                    if chunk.get("id"):
+                        raw["id"] = chunk["id"]
+                    if isinstance(chunk.get("usage"), dict):
+                        raw["usage"] = chunk["usage"]
+                    for choice in chunk.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        content.append(str(delta.get("content") or ""))
+                        reasoning.append(str(delta.get("reasoning_content") or ""))
+                        finish_reason = choice.get("finish_reason") or finish_reason
+        except HTTPError as exc:
+            raise ServerRequestError(f"HTTP {exc.code}: 模型流式请求失败") from exc
+        except TimeoutError as exc:
+            raise ServerRequestTimeout("智能审计单步模型请求超时") from exc
+        except URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise ServerRequestTimeout("智能审计单步模型请求超时") from exc
+            raise ServerRequestError("智能审计模型连接中断") from exc
+        except (ValueError, AttributeError, UnicodeDecodeError) as exc:
+            raise ServerRequestError("模型服务返回无效的流式 JSON") from exc
+        if not completed or finish_reason is None:
+            raise ServerRequestError("模型流式响应未完整结束，不能应用部分输出")
+        raw["choices"] = [{"finish_reason": finish_reason, "message": {
+            "content": "".join(content), "reasoning_content": "".join(reasoning),
+        }}]
+        return raw
 
     def _request(
         self,

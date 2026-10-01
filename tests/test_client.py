@@ -1,10 +1,11 @@
 import json
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from omni_ai_controller.client import ModelServerClient, ServerRequestError
+from omni_ai_controller.client import ModelServerClient, ServerRequestCancelled, ServerRequestError, ServerRequestTimeout
 from omni_ai_controller.config import ServerConfig
 
 
@@ -89,3 +90,48 @@ def test_chat_json_sends_strict_schema() -> None:
     assert payload["response_format"]["json_schema"]["strict"] is True
     assert payload["response_format"]["json_schema"]["name"] == "test_schema"
     assert result.raw["id"] == "local-1"
+
+
+def test_streaming_json_keeps_content_finish_reason_and_token_usage():
+    events = [
+        {"id": "stream-1", "choices": [{"delta": {"content": '{"summary":"'}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": '完成"}'}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"total_tokens": 123}},
+    ]
+    wire = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events) + b"data: [DONE]\n\n"
+    response = BytesIO(wire)
+    with patch("omni_ai_controller.client.urlopen", return_value=response) as request:
+        result = ModelServerClient(config()).chat_json([], schema_name="test", schema={}, stream=True, timeout=42)
+    assert result.content == '{"summary":"完成"}'
+    assert result.raw["choices"][0]["finish_reason"] == "stop"
+    assert result.raw["usage"]["total_tokens"] == 123
+    assert request.call_args.kwargs["timeout"] == 42
+    assert json.loads(request.call_args.args[0].data)["stream_options"] == {"include_usage": True}
+    assert response.closed
+
+
+def test_streaming_json_timeout_closes_connection_and_rejects_partial_output():
+    response = BytesIO(b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')
+    with patch("omni_ai_controller.client.urlopen", return_value=response), patch(
+        "omni_ai_controller.client.monotonic", side_effect=[0, 1, 11],
+    ):
+        with pytest.raises(ServerRequestTimeout):
+            ModelServerClient(config()).chat_json([], schema_name="test", schema={}, stream=True, timeout=10)
+    assert response.closed
+
+
+def test_streaming_json_requires_done_and_a_finish_reason():
+    response = BytesIO(b'data: {"choices":[{"delta":{"content":"{}"},"finish_reason":"stop"}]}\n\n')
+    with patch("omni_ai_controller.client.urlopen", return_value=response):
+        with pytest.raises(ServerRequestError, match="未完整结束"):
+            ModelServerClient(config()).chat_json([], schema_name="test", schema={}, stream=True)
+    assert response.closed
+
+
+def test_parent_cancellation_closes_model_stream_without_applying_partial_json():
+    response = BytesIO(b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')
+    flags = iter([False, True])
+    with patch("omni_ai_controller.client.urlopen", return_value=response):
+        with pytest.raises(ServerRequestCancelled):
+            ModelServerClient(config()).chat_json([], schema_name="test", schema={}, stream=True, cancelled=lambda: next(flags))
+    assert response.closed

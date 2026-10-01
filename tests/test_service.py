@@ -440,6 +440,21 @@ class FakeStatementClient:
         }
 
 
+def test_internal_audit_progress_uses_internal_token_without_network_header():
+    with client() as test_client:
+        url = "/internal/audit/progress/not-an-existing-run"
+        assert test_client.get(url).status_code == 401
+        assert test_client.get(url, headers={"X-Vision-Token": "wrong"}).status_code == 401
+        response = test_client.get(url, headers={"X-Vision-Token": "internal-vision-token"})
+        assert response.status_code == 200
+        assert response.json() == {}
+        assert test_client.get("/internal/audit/progress-evasion").status_code == 403
+        assert test_client.post("/internal/audit/cancel/not-an-existing-run").status_code == 401
+        cancel = test_client.post("/internal/audit/cancel/not-an-existing-run", headers={"X-Vision-Token": "internal-vision-token"})
+        assert cancel.status_code == 200
+        assert cancel.json() == {"cancel_requested": False}
+
+
 def client(
     controller: FakeController | None = None,
     store: FakeAdminAccountStore | None = None,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hmac
@@ -21,7 +22,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, SecretStr
 
 from .admin import AdminCommandError, AdminController
-from .agentic_audit import analyze_agentic_audit, get_audit_progress
+from .agentic_audit import analyze_agentic_audit, cancel_audit_run, get_audit_progress
 from .audit_skill import AuditSkillError, analyze_audit
 from .bank_statement import (
     MAX_STATEMENT_PAGES,
@@ -356,7 +357,7 @@ def create_app(
 
     @application.middleware("http")
     async def restrict_network(request: Request, call_next):  # type: ignore[no-untyped-def]
-        if request.url.path in {
+        if request.url.path.startswith(("/internal/audit/progress/", "/internal/audit/cancel/")) or request.url.path in {
             "/health/live",
             "/internal/vision/receipts",
             "/internal/vision/bank-statements",
@@ -908,17 +909,29 @@ def create_app(
     def audit_progress(run_id: str) -> dict[str, Any]:
         return get_audit_progress(run_id)
 
+    @application.post("/internal/audit/cancel/{run_id}", dependencies=[vision_internal])
+    def cancel_internal_audit(run_id: str) -> dict[str, bool]:
+        return {"cancel_requested": cancel_audit_run(run_id)}
+
     @application.post("/internal/audit/agentic", dependencies=[vision_internal])
-    def reconcile_audit_with_li_and_ma(
-        payload: AuditReconciliationRequest,
+    async def reconcile_audit_with_li_and_ma(
+        payload: AuditReconciliationRequest, request: Request,
     ) -> dict[str, object]:
         active_controller.model_server.refresh()
+        run_id = str(payload.context.get("_run_id") or payload.audit_id)
+        task = asyncio.create_task(asyncio.to_thread(
+            analyze_agentic_audit, active_controller.model_server.client,
+            audit_id=payload.audit_id, context=payload.context,
+        ))
         try:
-            return analyze_agentic_audit(
-                active_controller.model_server.client,
-                audit_id=payload.audit_id,
-                context=payload.context,
-            )
+            while not task.done():
+                done, _ = await asyncio.wait({task}, timeout=1)
+                if not done and await request.is_disconnected():
+                    cancel_audit_run(run_id)
+            return await task
+        except asyncio.CancelledError:
+            cancel_audit_run(run_id)
+            raise
         except AuditSkillError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,

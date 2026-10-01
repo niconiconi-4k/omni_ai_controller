@@ -225,7 +225,8 @@ def test_worker_chunks_limit_output_candidates_without_splitting_transaction() -
         ],
     }
     chunks = _worker_chunks(context)
-    assert [len(chunk["deterministic_candidates"]) for chunk in chunks] == [8, 2]
+    assert [len(chunk["deterministic_candidates"]) for chunk in chunks] == [2, 2, 2, 2, 2]
+    assert {item["transaction_id"] for chunk in chunks for item in chunk["deterministic_candidates"]} == {f"tx-{i}" for i in range(10)}
 
 
 def _small_context() -> dict:
@@ -296,7 +297,7 @@ def test_truncated_single_transaction_retries_once(stage: str) -> None:
     result = analyze_agentic_audit(client, audit_id=f"{stage}-retry", context=_small_context())
     assert "error_code" not in result
     retry_index = 2 if stage == "worker" else 3
-    assert client.calls[retry_index]["max_tokens"] == 8192
+    assert client.calls[retry_index - 1]["max_tokens"] < client.calls[retry_index]["max_tokens"] <= 8192
     assert len(client.calls) == 4
     assert get_audit_progress(f"{stage}-retry")["status"] == "completed"
 
@@ -362,3 +363,83 @@ def test_split_budget_exhaustion_is_partial_not_an_unbounded_loop(monkeypatch) -
     assert result["worker_batch_count"] == 1
     assert result["result"]["decisions"] == []
     assert len(client.calls) == 2
+
+
+def test_large_audit_is_planned_as_bounded_two_transaction_tasks():
+    context = {
+        "transactions": [{"id": f"t{i}"} for i in range(40)],
+        "receipts": [{"id": f"r{i}"} for i in range(40)],
+        "deterministic_candidates": [{"transaction_id": f"t{i}", "receipt_upload_id": f"r{i}"} for i in range(40)],
+    }
+    chunks = _worker_chunks(context)
+    assert len(chunks) == 20
+    assert sum(len(chunk["deterministic_candidates"]) for chunk in chunks) == 40
+    assert all(len(chunk["transactions"]) <= 2 for chunk in chunks)
+
+
+def test_slow_batch_is_split_and_other_transactions_continue():
+    from omni_ai_controller.client import ServerRequestTimeout
+
+    class SlowOnce(FakeClient):
+        def chat_json(self, messages, **kwargs):
+            if len(self.calls) == 1:
+                self.calls.append({"schema_name": kwargs["schema_name"]})
+                raise ServerRequestTimeout("simulated slow worker")
+            return super().chat_json(messages, **kwargs)
+
+    client = SlowOnce([_plan(), _worker(), _final(), _worker(), _final()])
+    result = analyze_agentic_audit(client, audit_id="slow-split", context=_grouped_context())
+    assert not result.get("error_code")
+    assert result["worker_batch_count"] == 2
+    assert len([step for step in result["steps"] if step["step_kind"] == "final_assessment" and step["status"] == "completed"]) == 2
+    assert any(step.get("error_code") == "agentic_step_timeout" for step in result["steps"])
+    assert all(call.get("timeout", 240) <= 240 for call in client.calls)
+
+
+def test_shared_deadline_does_not_submit_more_model_requests():
+    client = FakeClient([_plan(), _worker(), _final()])
+    result = analyze_agentic_audit(client, audit_id="expired-deadline", context={**_small_context(), "_deadline": 1})
+    assert result["error_code"] == "agentic_iteration_budget"
+    assert result["result"]["decisions"] == []
+    assert client.calls == []
+
+
+def test_deadline_retains_completed_final_approvals(monkeypatch):
+    from omni_ai_controller import agentic_audit as module
+
+    class Clocked(FakeClient):
+        def chat_json(self, messages, **kwargs):
+            response = super().chat_json(messages, **kwargs)
+            if len(self.calls) == 3:
+                monkeypatch.setattr(module, "time", lambda: 10000)
+            return response
+
+    decision = {"transaction_id": "tx-1", "receipt_upload_ids": ["receipt-1"], "recommendation": "match", "confidence": .95}
+    worker = {**_worker(), "decisions": [decision]}
+    final = {**_final(), "decisions": [decision]}
+    monkeypatch.setattr(module, "time", lambda: 10)
+    monkeypatch.setattr(module, "MAX_WORKER_CHUNK_CANDIDATES", 1)
+    client = Clocked([_plan(), worker, final])
+    result = analyze_agentic_audit(client, audit_id="deadline-after-approval", context={**_grouped_context(), "_deadline": 200})
+    assert result["error_code"] == "agentic_iteration_budget"
+    assert result["result"]["decisions"] == [decision]
+    assert len(client.calls) == 3
+
+
+def test_parent_cancellation_preserves_approvals_and_skips_remaining_tasks(monkeypatch):
+    from omni_ai_controller import agentic_audit as module
+
+    class CancellingClient(FakeClient):
+        def chat_json(self, messages, **kwargs):
+            response = super().chat_json(messages, **kwargs)
+            if len(self.calls) == 3:
+                assert module.cancel_audit_run("cancel-after-approval")
+            return response
+
+    decision = {"transaction_id": "tx-1", "receipt_upload_ids": ["receipt-1"], "recommendation": "match", "confidence": .95}
+    monkeypatch.setattr(module, "MAX_WORKER_CHUNK_CANDIDATES", 1)
+    client = CancellingClient([_plan(), {**_worker(), "decisions": [decision]}, {**_final(), "decisions": [decision]}])
+    result = analyze_agentic_audit(client, audit_id="cancel-after-approval", context=_grouped_context())
+    assert result["error_code"] == "agentic_cancelled"
+    assert result["result"]["decisions"] == [decision]
+    assert len(client.calls) == 3
