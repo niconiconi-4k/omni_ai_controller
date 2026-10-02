@@ -922,7 +922,7 @@ def create_app(
     @application.post("/internal/audit/agentic", dependencies=[vision_internal])
     async def reconcile_audit_with_li_and_ma(
         payload: AuditReconciliationRequest, request: Request,
-    ) -> dict[str, object]:
+    ) -> Any:
         active_controller.model_server.refresh()
         run_id = str(payload.context.get("_run_id") or payload.audit_id)
         task = asyncio.create_task(asyncio.to_thread(
@@ -939,10 +939,12 @@ def create_app(
             cancel_audit_run(run_id)
             raise
         except AuditSkillError as exc:
-            raise HTTPException(
+            snapshot = get_audit_progress(run_id)
+            return JSONResponse(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=str(exc),
-            ) from exc
+                content={"detail": str(exc), "agent_state": snapshot.get("agent_state"),
+                         "steps": snapshot.get("steps") or [], "usage": snapshot.get("usage") or {}},
+            )
 
     @application.post("/internal/support/chat", dependencies=[vision_internal])
     def support_chat(payload: SupportChatRequest) -> dict[str, str]:

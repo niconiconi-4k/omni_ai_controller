@@ -307,7 +307,8 @@ def test_truncated_batch_splits_only_between_transactions(stage: str) -> None:
     responses = [_plan()]
     if stage == "final":
         responses.append(_worker())
-    responses += ["{truncated", _worker(), _final(), _worker(), _final()]
+    responses += (["{truncated", _worker(), _final(), _worker(), _final()] if stage == "worker"
+                  else ["{truncated", _final(), _final()])
     client = FakeClient(responses, length_calls={2 if stage == "worker" else 3})
     result = analyze_agentic_audit(client, audit_id=f"{stage}-split", context=_grouped_context())
     assert "error_code" not in result
@@ -316,8 +317,13 @@ def test_truncated_batch_splits_only_between_transactions(stage: str) -> None:
         step for step in result["steps"]
         if step["step_kind"] == "evidence_review" and step["status"] == "completed"
     ]
-    assert [step["input_summary"]["candidate_count"] for step in completed_workers[-2:]] == [2, 1]
-    assert [call["schema"]["properties"]["decisions"]["maxItems"] for call in client.calls if call["schema_name"] == "ma_shifu_evidence_review"][-2:] == [2, 1]
+    counts = [step["input_summary"]["candidate_count"] for step in completed_workers]
+    assert counts == ([2, 1] if stage == "worker" else [3])
+    schemas = [call["schema"] for call in client.calls if call["schema_name"] == "ma_shifu_evidence_review"]
+    assert all("decisions" not in schema["properties"] for schema in schemas)
+    assert [schema["properties"]["observations"]["maxItems"] for schema in schemas][-2:] == ([2, 1] if stage == "worker" else [3])
+    if stage == "final":
+        assert result["agent_state"]["stats"]["evidence_reuses"] == 2
 
 
 def test_failed_single_group_does_not_discard_other_approved_batches(monkeypatch) -> None:
@@ -341,7 +347,8 @@ def test_agentic_output_bounds_do_not_mutate_shared_legacy_schema() -> None:
     analyze_agentic_audit(client, audit_id="schema-bounds", context=_small_context())
     schema = client.calls[1]["schema"]
     assert schema["properties"]["summary"]["maxLength"] == 320
-    assert schema["properties"]["decisions"]["maxItems"] == 1
+    assert "decisions" not in schema["properties"]
+    assert schema["properties"]["observations"]["maxItems"] == 1
     assert "maxLength" not in _WORKER_SCHEMA["properties"]["summary"]
     assert AUDIT_DECISIONS_SCHEMA["maxItems"] == 200
 

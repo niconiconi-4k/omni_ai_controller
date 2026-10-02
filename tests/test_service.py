@@ -753,6 +753,7 @@ def test_vision_settings_and_internal_proxy_are_protected() -> None:
         )
         assert agentic.status_code == 200, agentic.text
         assert agentic.json()["process_mode"] == "agentic"
+        assert set(agentic.json()["agent_state"]["notebooks"]) == {"audit_planner", "evidence_worker"}
         assert [step["agent_kind"] for step in agentic.json()["steps"]] == [
             "audit_planner", "evidence_worker", "audit_planner",
         ]
@@ -785,6 +786,31 @@ def test_internal_agentic_output_limit_returns_partial_result_instead_of_502() -
         assert response.json()["error_code"] == "agentic_output_limit"
         assert response.json()["result"]["decisions"] == []
         assert len(response.json()["steps"]) == 2
+        assert response.json()["agent_state"]["audit_id"] == "audit-output-limit"
+
+
+def test_internal_agentic_failure_returns_notebooks_without_changing_detail_contract() -> None:
+    controller = FakeController()
+    original_chat = controller.model_server.client.chat_json
+
+    def invalid_worker(messages, **kwargs):
+        if kwargs["schema_name"] == "ma_shifu_evidence_review":
+            return SimpleNamespace(content="not-json", raw={"choices": [{"finish_reason": "stop"}]})
+        return original_chat(messages, **kwargs)
+
+    controller.model_server.client.chat_json = invalid_worker
+    with client(controller=controller) as test_client:
+        response = test_client.post("/internal/audit/agentic", headers={"X-Vision-Token": "internal-vision-token"}, json={
+            "audit_id": "api-failed", "context": {"transactions": [{"id": "tx"}], "receipts": [{"id": "r", "amount": 1200}],
+                                                   "deterministic_candidates": [{"transaction_id": "tx", "receipt_upload_id": "r"}]},
+        })
+        assert response.status_code == 502
+        payload = response.json()
+        assert isinstance(payload["detail"], str) and "返回格式无效" in payload["detail"]
+        assert payload["agent_state"]["audit_id"] == "api-failed"
+        assert payload["agent_state"]["notebooks"]["evidence_worker"]["entries"]
+        assert payload["agent_state"]["task_lists"]["evidence_worker"][0]["status"] == "failed"
+        assert len(payload["steps"]) == 1
 
 
 def test_internal_vision_rejects_document_total_before_forwarding(monkeypatch) -> None:
