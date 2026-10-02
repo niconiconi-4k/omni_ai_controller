@@ -208,7 +208,7 @@ class ConversationChatRequest(BaseModel):
 
 
 class VisionSettingsUpdate(BaseModel):
-    model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] = "gpt-6-sol"
+    model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol", "gpt-6.1-sol"] = "gpt-6.1-sol"
     api_key: SecretStr | None = Field(default=None)
 
 
@@ -226,7 +226,9 @@ class VisionAnalyzeRequest(BaseModel):
     pages: list[VisionPageRequest] | None = Field(default=None, min_length=1, max_length=12)
     page_count: int | None = Field(default=None, ge=1, le=12)
     document_text: str | None = Field(default=None, max_length=100_000)
-    model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol"] | None = None
+    model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol", "gpt-6.1-sol"] | None = None
+    source_kind: Literal["legacy", "image", "pdf_rendered"] = "legacy"
+    document_hint: Literal["auto", "receipt", "invoice"] = "auto"
     classify: bool = True
     subject_company_name: str | None = Field(default=None, max_length=255)
     audit_period_start: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
@@ -712,6 +714,8 @@ def create_app(
 
     @application.post("/internal/vision/receipts", dependencies=[vision_internal])
     def analyze_receipt(payload: VisionAnalyzeRequest) -> dict[str, object]:
+        if payload.source_kind == "pdf_rendered" and (not payload.pages or payload.document_text):
+            raise HTTPException(status_code=422, detail="Visual PDF requires rendered pages without a text layer")
         legacy_supplied = any(
             value is not None
             for value in (payload.filename, payload.content_type, payload.image_base64)
@@ -798,6 +802,7 @@ def create_app(
                     subject_company_name=payload.subject_company_name,
                     audit_period_start=payload.audit_period_start,
                     audit_period_end=payload.audit_period_end,
+                    **({"source_kind": payload.source_kind} if payload.source_kind != "legacy" else {}),
                 )
             image, filename, content_type, _ = decoded_pages[0]
             return active_vision_client.recognize(
@@ -809,6 +814,7 @@ def create_app(
                 subject_company_name=payload.subject_company_name,
                 audit_period_start=payload.audit_period_start,
                 audit_period_end=payload.audit_period_end,
+                **({"document_hint": payload.document_hint} if payload.document_hint != "auto" else {}),
             )
         except VisionRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

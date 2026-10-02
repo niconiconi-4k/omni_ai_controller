@@ -29,8 +29,8 @@ class FakeResponse:
 def test_unconfigured_vision_defaults_to_gpt6_without_overwriting_explicit_model(tmp_path):
     store = VisionSettingsStore(tmp_path / "vision.json")
     status = store.status()
-    assert status["model"] == "gpt-6-sol"
-    assert [item["id"] for item in status["models"] if item["default"]] == ["gpt-6-sol"]
+    assert status["model"] == "gpt-6.1-sol"
+    assert [item["id"] for item in status["models"] if item["default"]] == ["gpt-6.1-sol"]
     store.save(model="gpt-4.1", api_key="sk-test-012345678901234567890")
     assert store.status()["model"] == "gpt-4.1"
 

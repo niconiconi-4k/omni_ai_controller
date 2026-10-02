@@ -25,10 +25,14 @@ SUPPORTED_VISION_MODELS: dict[str, dict[str, object]] = {
     "gpt-6-sol": {
         "label": "GPT-6 Sol",
         "description": "适合复杂凭证与银行流水识别，约 1M 上下文",
+        "default": False,
+    },
+    "gpt-6.1-sol": {
+        "label": "GPT-6.1 Sol", "description": "票据视觉提取与分类，支持图像和结构化输出",
         "default": True,
     },
 }
-DEFAULT_VISION_MODEL = "gpt-6-sol"
+DEFAULT_VISION_MODEL = "gpt-6.1-sol"
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 MAX_VISION_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_VISION_DOCUMENT_BYTES = 32 * 1024 * 1024
@@ -85,8 +89,9 @@ PARTY_SCHEMA: dict[str, Any] = {
     "properties": {
         "name": {"type": ["string", "null"]},
         "organization_number": {"type": ["string", "null"]},
+        "account_numbers": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["name", "organization_number"],
+    "required": ["name", "organization_number", "account_numbers"],
 }
 
 FINANCIAL_FACTS_SCHEMA: dict[str, Any] = {
@@ -122,12 +127,25 @@ FINANCIAL_FACTS_SCHEMA: dict[str, Any] = {
         },
         "payer": PARTY_SCHEMA,
         "payee": PARTY_SCHEMA,
+        "taxes": {
+            "type": "array", "maxItems": 12, "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "label": {"type": "string"},
+                    "rate_percent": {"type": ["string", "null"]},
+                    "amount_decimal": {"type": ["string", "null"]},
+                    "taxable_amount_decimal": {"type": ["string", "null"]},
+                    "currency": {"type": ["string", "null"]},
+                },
+                "required": ["label", "rate_percent", "amount_decimal", "taxable_amount_decimal", "currency"],
+            },
+        },
     },
     "required": [
         "amount_text", "amount_decimal", "amount_effect", "currency", "reference_numbers",
         "account_numbers", "transaction_time_text", "transaction_time_iso",
         "transaction_time_role", "document_kind", "document_date_iso", "due_date_iso", "amount_components",
-        "payer", "payee",
+        "payer", "payee", "taxes",
     ],
 }
 
@@ -156,6 +174,8 @@ RECEIPT_RESULT_SCHEMA: dict[str, Any] = {
     "properties": {
         "page_start": {"type": "integer", "minimum": 1, "maximum": 12},
         "page_end": {"type": "integer", "minimum": 1, "maximum": 12},
+        "source_pages": {"type": "array", "minItems": 1, "maxItems": 12,
+                 "items": {"type": "integer", "minimum": 1, "maximum": 12}},
         "relevance": {
             "type": "string",
             "enum": ["unassessed"],
@@ -171,10 +191,22 @@ RECEIPT_RESULT_SCHEMA: dict[str, Any] = {
         "classification": CLASSIFICATION_RESULT_SCHEMA,
     },
     "required": [
-        "page_start", "page_end", "relevance", "relevance_reason",
+        "page_start", "page_end", "source_pages", "relevance", "relevance_reason",
         "document_date_text", "document_date_iso", "due_date_text", "due_date_iso",
         "text", "payment_candidates", "financial_facts", "classification",
     ],
+}
+
+PAGE_DISPOSITIONS = ("financial", "continuation", "advertisement", "terms",
+                     "transaction_history", "blank", "unreadable", "unknown")
+PAGE_REVIEW_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "page_number": {"type": "integer", "minimum": 1, "maximum": 12},
+        "disposition": {"type": "string", "enum": list(PAGE_DISPOSITIONS)},
+        "reason": {"type": "string", "maxLength": 160},
+    },
+    "required": ["page_number", "disposition", "reason"],
 }
 
 
@@ -308,6 +340,7 @@ class OpenAIVisionClient:
         subject_company_name: str | None = None,
         audit_period_start: str | None = None,
         audit_period_end: str | None = None,
+        document_hint: str = "auto",
     ) -> dict[str, Any]:
         return self.recognize_document(
             [(image, filename, content_type, 1)],
@@ -317,6 +350,7 @@ class OpenAIVisionClient:
             subject_company_name=subject_company_name,
             audit_period_start=audit_period_start,
             audit_period_end=audit_period_end,
+            source_kind="image", document_hint=document_hint,
         )
 
     def recognize_document(
@@ -330,10 +364,17 @@ class OpenAIVisionClient:
         subject_company_name: str | None = None,
         audit_period_start: str | None = None,
         audit_period_end: str | None = None,
+        source_kind: str = "legacy",
+        document_hint: str = "auto",
     ) -> dict[str, Any]:
         page_count = page_count_override or max((page[3] for page in pages), default=0)
         if page_count < 1 or page_count > 12:
             raise VisionRequestError("文档页数必须介于 1 到 12 页", status_code=400)
+        if source_kind == "pdf_rendered":
+            if document_text or sorted(page[3] for page in pages) != list(range(1, page_count + 1)):
+                raise VisionRequestError("视觉 PDF 必须提供全部唯一页面且不得混入文字层", status_code=422)
+        if source_kind == "image" and (len(pages) != 1 or document_text):
+            raise VisionRequestError("照片必须提供单张图片且不得混入文字层", status_code=422)
         if not pages and not (document_text or "").strip():
             raise VisionRequestError("文档不包含可识别文字或页面", status_code=400)
         if any(page[3] > page_count for page in pages):
@@ -371,7 +412,7 @@ class OpenAIVisionClient:
             {
                 "type": "text",
                 "text": (
-                    "Analyze the ordered PDF page content as a document package that may contain multiple distinct "
+                    "Analyze the ordered source page content as a document package that may contain multiple distinct "
                     "invoices, receipts, credit notes, reminders, or unrelated historical documents. Split "
                     "every distinct financial document into one receipts item and give its inclusive page "
                     "range. Every identified receipt must receive its own complete financial facts and "
@@ -428,6 +469,34 @@ class OpenAIVisionClient:
                 ),
             }
         ]
+        source_instruction = (
+            "This source is a photograph, not a PDF. Distinguish a photographed shop receipt "
+            "from a photographed bill/invoice using its visible layout and labels. "
+            f"User document hint is {document_hint}; it is guidance, not financial evidence. "
+            if source_kind == "image" else
+            "This PDF is supplied exclusively as visible rendered page images. Never rely on "
+            "an invisible PDF text layer. Inspect ALL pages once; do not skip pages by month. "
+            if source_kind == "pdf_rendered" else ""
+        )
+        user_content[0]["text"] = source_instruction + user_content[0]["text"] + (
+            " Amount is the primary extraction target. Preserve merchant, payer/payee identities, "
+            "organization numbers, bank/payment accounts and invoice/OCR/reference exactly. "
+            "Put an account under payer or payee only when its owner is visibly established; retain "
+            "unassigned accounts in account_numbers. Extract labelled VAT/tax rates, tax amounts and "
+            "taxable bases into taxes; unknown values stay null, never infer taxes or use a tax/subtotal "
+            "instead of the final paid/payable total. For bills distinguish issue date, due date and "
+            "actual payment date; do not invent a transaction at issue/deadline. A bill may be paid "
+            "near its deadline, but payment matching belongs to the later audit. Refunds remain signed negative. "
+            "Return one page_reviews entry for EVERY source page, with a short disposition and reason, "
+            "never a transcript. Advertisements, terms, blanks and transaction-history appendices "
+            "are not financial documents and must not create receipts or amount candidates. "
+            "A page containing both a real bill and advertising is financial: keep its financial fields. "
+            "Group continuation pages of the SAME invoice into one receipt, not repeated totals. "
+            "Use source_pages for its actual financial/continuation pages; page_start/end are only "
+            "the enclosing range, not permission to attach unrelated intervening pages. "
+            "If no financial document exists return receipts=[] and primary_receipt_index=null, "
+            "with needs_manual_confirmation and a short reason. Never manufacture a receipt from advertising."
+        )
         if document_text:
             layout_guidance = (
                 "Use rendered pages to resolve columns, tables and visual conflicts; "
@@ -488,21 +557,27 @@ class OpenAIVisionClient:
                             "primary_receipt_index": {"type": ["integer", "null"], "minimum": 1},
                             "text": {"type": "string"},
                             "receipts": {
-                                "type": "array", "minItems": 1, "maxItems": 36,
+                                "type": "array", "minItems": 0, "maxItems": 36,
                                 "items": RECEIPT_RESULT_SCHEMA,
                             },
+                            "page_reviews": {"type": "array", "minItems": 1, "maxItems": 12,
+                                             "items": PAGE_REVIEW_SCHEMA},
                             "financial_facts": FINANCIAL_FACTS_SCHEMA,
                             "classification": CLASSIFICATION_RESULT_SCHEMA,
                         },
                         "required": [
                             "status", "reasons", "primary_receipt_index", "text", "receipts",
-                            "financial_facts", "classification",
+                            "financial_facts", "classification", "page_reviews",
                         ],
                     },
                 },
             },
         }
-        if model == "gpt-6-sol":
+        if model == "gpt-6.1-sol":
+            # Sol 6.1 requires reasoning; none/minimal and sampling overrides are not used.
+            payload["reasoning_effort"] = "low"
+            payload["max_completion_tokens"] = 16384
+        elif model == "gpt-6-sol":
             payload["reasoning_effort"] = "none"
             payload["temperature"] = 0
             payload["max_completion_tokens"] = 8192
@@ -578,8 +653,9 @@ class OpenAIVisionClient:
             return normalized
 
         raw_receipts = result.get("receipts")
-        uses_receipt_schema = isinstance(raw_receipts, list) and bool(raw_receipts)
-        if not isinstance(raw_receipts, list) or not raw_receipts:
+        reviewed_pages = isinstance(result.get("page_reviews"), list)
+        uses_receipt_schema = isinstance(raw_receipts, list) and (bool(raw_receipts) or reviewed_pages)
+        if not isinstance(raw_receipts, list) or (not raw_receipts and not reviewed_pages):
             raw_receipts = [{
                 "page_start": 1,
                 "page_end": page_count,
@@ -610,6 +686,10 @@ class OpenAIVisionClient:
                 "index": index,
                 "page_start": page_start,
                 "page_end": page_end,
+                "source_pages": sorted({
+                    value for value in (raw_receipt.get("source_pages") or list(range(page_start, page_end + 1)))
+                    if isinstance(value, int) and not isinstance(value, bool) and page_start <= value <= page_end
+                }),
                 "relevance": "unassessed",
                 "relevance_reason": "deferred_to_audit",
                 "document_date_text": raw_receipt.get("document_date_text"),
@@ -626,6 +706,14 @@ class OpenAIVisionClient:
                     receipt_classification if isinstance(receipt_classification, dict) else {}
                 ),
             }
+            reviews_by_page = {item.get("page_number"): item.get("disposition")
+                               for item in (result.get("page_reviews") or []) if isinstance(item, dict)}
+            nonfinancial = {"advertisement", "terms", "transaction_history", "blank"}
+            # This is content-type filtering, never audit-month/ownership/duplicate filtering.
+            if normalized_receipt["source_pages"] and all(
+                reviews_by_page.get(number) in nonfinancial for number in normalized_receipt["source_pages"]
+            ):
+                continue
             classification_type = str(
                 normalized_receipt["classification"].get("document_type") or ""
             )
@@ -678,6 +766,18 @@ class OpenAIVisionClient:
         if not isinstance(classification, dict):
             classification = {}
         reasons = [str(value) for value in (result.get("reasons") or [])]
+        page_reviews = []
+        raw_reviews = result.get("page_reviews") or []
+        for page_number in range(1, page_count + 1):
+            review = next((item for item in raw_reviews if isinstance(item, dict)
+                           and item.get("page_number") == page_number), {})
+            page_reviews.append({
+                "page_number": page_number,
+                "disposition": review.get("disposition") if review.get("disposition") in PAGE_DISPOSITIONS else "unknown",
+                "reason": str(review.get("reason") or "unassessed")[:160],
+            })
+        if reviewed_pages and not receipts:
+            reasons.append("未发现财务凭证；非票据页面仅保留简短元数据")
         if primary is None and receipts and not all_receipts_excluded:
             reasons.append("没有可自动纳入当前审计期间的主票据")
         elif all_receipts_excluded:
@@ -696,6 +796,7 @@ class OpenAIVisionClient:
             },
             "primary_receipt_index": primary.get("index") if primary else None,
             "receipts": receipts,
+            "page_reviews": page_reviews,
             "financial_facts": financial_facts,
             "classification": classification,
             "processing_ms": round((time.perf_counter() - started) * 1000, 2),
