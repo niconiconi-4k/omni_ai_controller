@@ -11,6 +11,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .receipt_wire import compact_receipt_schema, expand_receipt_result
+
 SUPPORTED_VISION_MODELS: dict[str, dict[str, object]] = {
     "gpt-4o": {
         "label": "GPT-4o",
@@ -400,6 +402,7 @@ class OpenAIVisionClient:
         model = model_override or configured_model
         if model not in SUPPORTED_VISION_MODELS:
             raise VisionRequestError("不支持该 OpenAI 识图模型", status_code=422)
+        compact_output = model == "gpt-6.1-sol" and source_kind in {"image", "pdf_rendered"}
         classification_instruction = (
             VOUCHER_CLASSIFICATION_INSTRUCTION
             if classify
@@ -460,9 +463,11 @@ class OpenAIVisionClient:
                     + ". Treat company identity as classification context only when it is specific and visibly matches. "
                     "Select one 1-based primary_receipt_index as a backward-compatible representative receipt. "
                     "This does not make other receipts secondary or optional: every receipt must still be extracted "
-                    "and classified independently. Top-level text must be "
-                    "a package summary under 500 characters and must not repeat receipt excerpts; top-level "
-                    "financial_facts and classification must describe only the selected primary receipt. "
+                          "and classified independently. "
+                          + ("Do not repeat primary financial facts or classification at the top level; "
+                              "the service copies them from the selected receipt. " if compact_output else
+                              "Top-level text must be a package summary under 500 characters and must not repeat receipt "
+                              "excerpts; top-level financial_facts and classification must describe only the selected primary receipt. ")
                     + classification_instruction
                     + " Use needs_reupload only when page quality prevents reliable reading. Return only "
                     "data matching the supplied JSON schema."
@@ -497,6 +502,29 @@ class OpenAIVisionClient:
             "If no financial document exists return receipts=[] and primary_receipt_index=null, "
             "with needs_manual_confirmation and a short reason. Never manufacture a receipt from advertising."
         )
+        if compact_output:
+            # Remove only instructions to emit deterministic duplicates. Keep all extraction rules.
+            user_content[0]["text"] = user_content[0]["text"].replace(
+                "Split every distinct financial document into one receipts item and give its inclusive page range. ",
+                "Split every distinct financial document into one receipts item with source_pages. ",
+            ).replace(
+                "Set relevance=unassessed and relevance_reason='deferred_to_audit' for every financial receipt. ",
+                "Receipt relevance=unassessed and deferred_to_audit are assigned by the service. ",
+            ).replace(
+                "Preserve document and due dates both on the receipt and in financial_facts. ",
+                "Preserve document and due dates once in financial_facts; the service copies them to the receipt. ",
+            ).replace(
+                "Use source_pages for its actual financial/continuation pages; page_start/end are only "
+                "the enclosing range, not permission to attach unrelated intervening pages. ",
+                "Use source_pages for its actual financial/continuation pages; the service derives the enclosing "
+                "range, which is not permission to attach unrelated intervening pages. ",
+            )
+            if not classify:
+                user_content[0]["text"] = user_content[0]["text"].replace(
+                    classification_instruction,
+                    "Do not classify this document; local classification was requested. The service supplies "
+                    "the null classification placeholder. Determine status only from whether the image can be read reliably.",
+                )
         if document_text:
             layout_guidance = (
                 "Use rendered pages to resolve columns, tables and visual conflicts; "
@@ -573,6 +601,13 @@ class OpenAIVisionClient:
                 },
             },
         }
+        if compact_output:
+            schema = compact_receipt_schema(RECEIPT_RESULT_SCHEMA, classify=classify)
+            schema["properties"]["page_reviews"] = {
+                "type": "array", "minItems": 1, "maxItems": 12, "items": PAGE_REVIEW_SCHEMA,
+            }
+            schema["required"].append("page_reviews")
+            payload["response_format"]["json_schema"]["schema"] = schema
         if model == "gpt-6.1-sol":
             # Sol 6.1 requires reasoning; none/minimal and sampling overrides are not used.
             payload["reasoning_effort"] = "low"
@@ -626,6 +661,8 @@ class OpenAIVisionClient:
             raise VisionRequestError("OpenAI 返回了无效的识图结果") from exc
         if not isinstance(result, dict):
             raise VisionRequestError("OpenAI 返回了无效的识图结果")
+        if compact_output:
+            result = expand_receipt_result(result, page_count=page_count, classify=classify)
 
         def normalize_candidates(raw_candidates: Any) -> list[dict[str, Any]]:
             normalized: list[dict[str, Any]] = []
