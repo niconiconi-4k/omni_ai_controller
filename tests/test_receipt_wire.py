@@ -116,3 +116,70 @@ def test_compact_advertisement_stays_empty_without_fabricating_financial_facts(t
         result = OpenAIVisionClient(store).recognize(b"image", filename="ad.jpg", content_type="image/jpeg")
     assert result["receipts"] == [] and result["primary_receipt_index"] is None
     assert result["financial_facts"] == result["classification"] == {}
+
+
+@pytest.mark.parametrize("classify", [True, False])
+def test_channel_count_schema_is_strict_required_nullable_in_both_wire_shapes(classify):
+    compact = compact_receipt_schema(RECEIPT_RESULT_SCHEMA, classify=classify)
+
+    def strict(node):
+        if node.get("type") == "object":
+            assert node["additionalProperties"] is False
+            assert set(node["required"]) == set(node["properties"])
+        for child in node.get("properties", {}).values():
+            strict(child)
+        if isinstance(node.get("items"), dict):
+            strict(node["items"])
+        for child in node.get("$defs", {}).values():
+            strict(child)
+
+    strict(RECEIPT_RESULT_SCHEMA)
+    strict(compact)
+    for facts in (FINANCIAL_FACTS_SCHEMA, compact["properties"]["receipts"]["items"]["properties"]["financial_facts"]):
+        component = facts["properties"]["amount_components"]["items"]
+        assert component["properties"]["transaction_count"]["type"] == ["integer", "null"]
+        assert "transaction_count" in component["required"]
+        assert {"card", "cash", "swish", "fee", "other", "bank_transfer", "mobile_payment", "wallet"} <= set(component["properties"]["role"]["enum"])
+
+
+@pytest.mark.parametrize("source_kind", ["legacy", "image", "pdf_rendered", "text"])
+def test_channel_counts_explicit_evidence_and_historical_absence_survive_all_wire_modes(tmp_path, source_kind):
+    store = VisionSettingsStore(tmp_path / "vision.json")
+    store.save(model="gpt-6.1-sol", api_key="sk-test-12345678901234567890")
+    full, lean = model_results(1, [[1]])
+    parts = [
+        {"role": "swish", "label": "Swish(2)", "amount_decimal": "25", "currency": "EUR", "transaction_count": 2},
+        {"role": "cash", "label": "Cash(0)", "amount_decimal": "0", "currency": "EUR", "transaction_count": 0},
+        {"role": "card", "label": "Card", "amount_decimal": "70", "currency": "EUR"},
+        {"role": "bank_transfer", "label": "Bank transfer", "amount_decimal": "5", "currency": "EUR", "transaction_count": None},
+        {"role": "mobile_payment", "label": "Mobile(3)", "amount_decimal": "5", "currency": "EUR", "transaction_count": 3},
+        {"role": "wallet", "label": "Wallet(1)", "amount_decimal": "20", "currency": "EUR", "transaction_count": 1},
+    ] + [{"role": "other", "label": "Visible other channel " + "x" * 600, "amount_decimal": "1", "currency": "EUR", "transaction_count": None} for _ in range(40)]
+    result_data = full if source_kind == "legacy" else lean
+    result_data["receipts"][0]["financial_facts"]["amount_components"] = parts
+    pages = [] if source_kind == "text" else [(b"image", "page.jpg", "image/jpeg", 1)]
+    with patch("omni_ai_controller.vision.urlopen", return_value=fake_response(result_data)) as send:
+        result = OpenAIVisionClient(store).recognize_document(pages, document_text="Visible source" if source_kind == "text" else None, source_kind=source_kind)
+    assert result["financial_facts"]["amount_components"] == parts
+    assert result["receipts"][0]["financial_facts"]["amount_components"] == parts
+    assert "transaction_count" not in result["financial_facts"]["amount_components"][2]
+    assert result["financial_facts"]["amount_decimal"] == "-125.00"  # No duplicated/new gross.
+    payload = json.loads(send.call_args.args[0].data)
+    prompt = payload["messages"][0]["content"][0]["text"]
+    assert "Swish(2)" in prompt and "transaction_count=null" in prompt
+    assert "never count the same gross amount twice" in prompt
+    assert "Do not truncate amount_components" in prompt
+    assert "bank account, phone number, document brand, company name" in prompt
+
+
+@pytest.mark.parametrize("count,label", [(2, "Swish"), (3, "Swish(2)"), (True, "Swish(1)"),
+    ("2", "Swish(2)"), (2.0, "Swish(2)"), (-2, "Swish(-2)")])
+def test_unsupported_count_is_null_not_inferred_or_financial_field_drop(tmp_path, count, label):
+    store = VisionSettingsStore(tmp_path / "vision.json")
+    store.save(model="gpt-6.1-sol", api_key="sk-test-12345678901234567890")
+    _, lean = model_results(1, [[1]])
+    part = {"role": "swish", "label": label, "amount_decimal": "25", "currency": "EUR", "transaction_count": count}
+    lean["receipts"][0]["financial_facts"]["amount_components"] = [part]
+    with patch("omni_ai_controller.vision.urlopen", return_value=fake_response(lean)):
+        result = OpenAIVisionClient(store).recognize(b"image", filename="r.jpg", content_type="image/jpeg")
+    assert result["financial_facts"]["amount_components"] == [{**part, "transaction_count": None}]

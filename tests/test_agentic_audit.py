@@ -234,8 +234,8 @@ def test_worker_chunks_limit_output_candidates_without_splitting_transaction() -
 
 def _small_context() -> dict:
     return {
-        "transactions": [{"id": "tx"}],
-        "receipts": [{"id": "receipt"}],
+        "transactions": [{"id": "tx", "amount": 1200, "direction": "debit"}],
+        "receipts": [{"id": "receipt", "amount": 1200, "type": "expense"}],
         "deterministic_candidates": [{"transaction_id": "tx", "receipt_upload_id": "receipt"}],
     }
 
@@ -270,8 +270,8 @@ def test_worker_and_planner_can_approve_same_kernel_relation():
 
 def _grouped_context() -> dict:
     return {
-        "transactions": [{"id": "tx-1"}, {"id": "tx-2"}],
-        "receipts": [{"id": f"receipt-{index}"} for index in range(3)],
+        "transactions": [{"id": "tx-1", "amount": 1200, "direction": "debit"}, {"id": "tx-2", "amount": 900, "direction": "debit"}],
+        "receipts": [{"id": f"receipt-{index}", "amount": 1200, "type": "expense"} for index in range(3)],
         "deterministic_candidates": [
             {"transaction_id": "tx-1", "receipt_upload_id": "receipt-0"},
             {"transaction_id": "tx-1", "receipt_upload_id": "receipt-1"},
@@ -479,8 +479,8 @@ def test_model_prompts_use_short_codes_and_restore_real_ids() -> None:
         }],
     }
     context = {
-        "transactions": [{"id": transaction_id}],
-        "receipts": [{"id": receipt_id}],
+        "transactions": [{"id": transaction_id, "amount": 1200, "direction": "debit"}],
+        "receipts": [{"id": receipt_id, "amount": 1200, "type": "expense"}],
         "deterministic_candidates": [{
             "transaction_id": transaction_id,
             "receipt_upload_id": receipt_id,
@@ -525,8 +525,8 @@ def test_income_match_can_disclose_unitemized_difference_without_blocking_relati
         }],
     }
     context = {
-        "transactions": [{"id": "tx"}],
-        "receipts": [{"id": "receipt"}],
+        "transactions": [{"id": "tx", "amount": 1170, "direction": "credit"}],
+        "receipts": [{"id": "receipt", "amount": 1200, "type": "income"}],
         "deterministic_candidates": [{
             "transaction_id": "tx",
             "receipt_upload_id": "receipt",

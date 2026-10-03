@@ -26,7 +26,7 @@ def _decision(tx="tx", receipts=None, **updates):
 
 def _two_context():
     return {"transactions": [{"id": "t1", "amount": -1200}, {"id": "t2", "amount": -900}],
-            "receipts": [{"id": "r1", "amount": 1200}, {"id": "r2", "amount": 900}],
+            "receipts": [{"id": "r1", "amount": 1200, "type": "expense"}, {"id": "r2", "amount": 900, "type": "expense"}],
             "deterministic_candidates": [{"transaction_id": "t1", "receipt_upload_id": "r1"}, {"transaction_id": "t2", "receipt_upload_id": "r2"}]}
 
 
@@ -74,7 +74,7 @@ def test_li_threshold_and_evidence_checks_do_not_need_ma_confidence(confidence, 
 
 
 def _groups_context():
-    return {"transactions": [{"id": "tx"}], "receipts": [{"id": f"r{i}"} for i in range(1, 5)],
+    return {"transactions": [{"id": "tx", "amount": -1200}], "receipts": [{"id": f"r{i}", "amount": 600, "type": "expense"} for i in range(1, 5)],
             "deterministic_candidates": [{"transaction_id": "tx", "receipt_upload_id": f"r{i}",
                                            "group_id": "A" if i < 3 else "B", "allocation_role": "employee_reimbursement"}
                                           for i in range(1, 5)]}
@@ -306,6 +306,8 @@ def test_every_task_transition_is_published_as_real_agent_state(monkeypatch):
 
 def test_income_adjustment_does_not_require_explicit_fee_and_role_prompts_remain_conservative():
     context = _small_context()
+    context["transactions"][0].update(amount=1170, direction="credit")
+    context["receipts"][0].update(type="income")
     context["deterministic_candidates"][0].update(allocation_role="revenue_settlement", amount_delta="-30", company_support=True)
     worker = _evidence(_observation(finding="销售1200，净到账1170，差额30仅推断扣费", evidence=["内核差额及公司/日期支持，无明确费用标签"]))
     decision = _decision(kind="revenue_settlement", discrepancy_note="差额30，扣费只是推断")
@@ -397,7 +399,7 @@ def test_legacy_suggestion_is_read_only_evidence_not_an_automatic_match():
 
 def test_full_kernel_group_is_not_accidentally_capped_by_six_text_items():
     ids = [f"r{i}" for i in range(7)]
-    context = {"transactions": [{"id": "tx"}], "receipts": [{"id": value} for value in ids],
+    context = {"transactions": [{"id": "tx", "amount": -700}], "receipts": [{"id": value, "amount": 100, "type": "expense"} for value in ids],
                "deterministic_candidates": [{"transaction_id": "tx", "receipt_upload_id": value, "group_id": "batch-7"} for value in ids]}
     decision = _decision(receipts=ids)
     client = FakeClient([_plan(), _evidence(_observation(receipts=ids, group_id="batch-7")), {**_final(), "decisions": [decision]}])

@@ -18,14 +18,14 @@ SEED_STRATEGY_ORDER = ["corporate_card_expenses", "direct_expenses", "revenue_se
 SEED_OBJECTIVES = ["整理全部流水与独立子票基础信息，按类型、币种和实际事件日期索引",
                    "只检索未确认内核候选，金额优先，身份详情按需提取",
                    "李师傅唯一审批；员工报销不凑单，工资差额仅疑似，异常最后复核"]
-BASIC_FIELDS = ("amount", "signed_amount", "total_amount", "currency", "currency_source",
+BASIC_FIELDS = ("cashflow_lane", "signed_cashflow_amount", "amount", "signed_amount", "total_amount", "currency", "currency_source",
                 "date", "date_role", "date_evidence", "time", "type", "category", "refund",
                 "document_type", "receipt_type", "direction", "payment_date", "value_date",
                 "transaction_date", "actual_payment_date", "sale_date", "event_date",
                 "issue_date", "due_date", "booking_date", "amount_decimal", "amount_text", "amount_effect",
                 "transaction_time_text", "transaction_time_iso", "transaction_time_role", "document_kind",
                 "document_date_iso", "due_date_iso", "amount_components")
-NON_EVENT_ROLES = {"issue", "issued", "creation", "due", "invoice_date", "issue_date", "due_date",
+NON_EVENT_ROLES = {"unknown", "issue", "issued", "creation", "due", "invoice_date", "issue_date", "due_date",
                    "document_issue", "document_creation", "document_due", "payment_due", "invoice_issue", "invoice_due"}
 
 
@@ -52,19 +52,98 @@ def source_amount(item: dict[str, Any]) -> Any:
     return None
 
 
-def category(item: dict[str, Any]) -> str:
+def _is_transaction(item: dict[str, Any], source_kind: str | None = None) -> bool:
+    if source_kind is not None:
+        return source_kind == "transaction"
+    return any(key in item for key in ("direction", "booking_date", "value_date"))
+
+
+def _decimal_amount(item: dict[str, Any]) -> Decimal | None:
+    raw = source_amount(item)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = Decimal(str(raw))
+        return value if value.is_finite() else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _receipt_category(item: dict[str, Any]) -> str:
     financial = item.get("financial_facts") if isinstance(item.get("financial_facts"), dict) else {}
+    words = " ".join(str(item.get(key) or "") for key in (
+        "type", "document_type", "receipt_type", "allocation_role",
+    )).lower() + " " + str(financial.get("document_kind") or "").lower()
+    if any(word in words for word in ("payroll", "salary", "工资")):
+        return "payroll"
+    if any(word in words for word in ("income", "revenue", "sales_report", "收入")):
+        return "income"
+    if any(word in words for word in ("expense", "tax_voucher", "loan_interest_voucher", "支出")):
+        return "expense"
+    return "unknown"
+
+
+def cashflow_facts(item: dict[str, Any], *, source_kind: str | None = None) -> dict[str, Any]:
+    """Economic sign, separate from matching magnitude and receipt reversal sign.
+
+    Bank positive magnitudes obey direction. Negative raw debit is valid;
+    credit plus negative raw is contradictory. Unknown direction/type is never
+    guessed from a document brand, filename, invoice date or cached lane.
+    """
+    unknown = {"cashflow_lane": "unknown", "signed_cashflow_amount": None}
+    value = _decimal_amount(item)
+    if value is None or value == 0:
+        return unknown
+    if _is_transaction(item, source_kind):
+        direction = str(item.get("direction") or "").strip().lower()
+        if direction in {"credit", "in", "inflow", "incoming"}:
+            if value < 0:
+                return unknown
+            lane = "in"
+        elif direction in {"debit", "out", "outflow", "outgoing"}:
+            if item.get("signed_amount") is not None and value > 0:
+                return unknown
+            lane = "out"
+        elif direction:
+            return unknown
+        else:
+            lane = "out" if value < 0 else "in"
+    else:
+        typ = _receipt_category(item)
+        explicit = item.get("category")
+        if explicit == "unknown":
+            return unknown
+        if typ == "unknown" and explicit in {"income", "expense", "payroll"}:
+            typ = explicit
+        if typ == "unknown":
+            return unknown
+        financial = item.get("financial_facts") if isinstance(item.get("financial_facts"), dict) else {}
+        effect = item.get("amount_effect") or financial.get("amount_effect")
+        reversal = item.get("refund") is True or explicit == "refund" or value < 0 or effect in {"reversal", "refund", "decrease", "credit"}
+        if value < 0 and effect == "normal":
+            return unknown
+        lane = "in" if (typ == "income") != reversal else "out"
+    magnitude = value.copy_abs()
+    signed = magnitude if lane == "in" else magnitude.copy_negate()
+    return {"cashflow_lane": lane, "signed_cashflow_amount": str(signed)}
+
+
+def category(item: dict[str, Any], *, source_kind: str | None = None) -> str:
+    financial = item.get("financial_facts") if isinstance(item.get("financial_facts"), dict) else {}
+    if _is_transaction(item, source_kind):
+        explicit = item.get("category")
+        if explicit in ("expense", "income", "refund", "payroll", "unknown"):
+            return explicit
+        return {"in": "income", "out": "expense"}.get(cashflow_facts(item, source_kind="transaction")["cashflow_lane"], "unknown")
     effect = item.get("amount_effect") or financial.get("amount_effect")
     if item.get("refund") is True or effect in ("reversal", "refund", "decrease", "credit"):
         return "refund"
     explicit = item.get("category")
     if explicit in ("expense", "income", "refund", "payroll", "unknown"):
         return explicit
-    try:
-        if Decimal(str(source_amount(item))) < 0:
-            return "refund"
-    except (InvalidOperation, TypeError, ValueError):
-        pass
+    value = _decimal_amount(item)
+    if value is not None and value < 0:
+        return "refund"
     words = " ".join(str(item.get(key) or "") for key in (
         "allocation_role", "type", "document_type", "receipt_type", "direction", "kind",
     )).lower() + " " + str(financial.get("document_kind") or "").lower()
@@ -74,7 +153,32 @@ def category(item: dict[str, Any]) -> str:
         return "payroll"
     if any(word in words for word in ("income", "revenue", "credit", "inflow", "incoming", "sales_report", "收入")) or item.get("direction") == "in":
         return "income"
-    return "expense"
+    return _receipt_category(item)
+
+
+def cashflow_sort_key(item: dict[str, Any]) -> tuple:
+    """Lane/currency/actual event precede subtype; stable ties, never UUID."""
+    lane = item.get("cashflow_lane")
+    if lane not in {"in", "out", "unknown"}:
+        lane = cashflow_facts(item)["cashflow_lane"]
+    actual = event_date(item)
+    return ({"in": 0, "out": 1, "unknown": 2}[lane], str(item.get("currency") or ""),
+            not actual, actual, str(item.get("category") or ""), str(item.get("type") or ""))
+
+
+def partition_cashflow(items: list[dict[str, Any]], *, source_kind: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Integration hook: separate worker lanes without splitting candidate groups.
+
+    Call on transaction sources, then keep each transaction's candidates atomic.
+    Unknown is a separate review bucket, not an income or expense fallback.
+    """
+    lanes: dict[str, list[dict[str, Any]]] = {"in": [], "out": [], "unknown": []}
+    for item in items:
+        projected = {**item, **cashflow_facts(item, source_kind=source_kind)}
+        lanes[projected["cashflow_lane"]].append(projected)
+    for rows in lanes.values():
+        rows.sort(key=cashflow_sort_key)
+    return lanes
 
 
 def event_date(item: dict[str, Any]) -> str:
@@ -94,13 +198,13 @@ def event_date(item: dict[str, Any]) -> str:
     return str(item.get("date") or item.get("booking_date") or "")
 
 
-def base_facts(source: dict[str, Any]) -> dict[str, Any]:
+def base_facts(source: dict[str, Any], *, source_kind: str | None = None) -> dict[str, Any]:
     content = {key: deepcopy(source[key]) for key in BASIC_FIELDS if key in source}
     financial = source.get("financial_facts")
     if isinstance(financial, dict):
         content["financial_facts"] = {key: deepcopy(financial[key]) for key in BASIC_FIELDS if key in financial}
-    content.update(id=source.get("id"), category=category(source), event_date=event_date(source),
-                   source_amount=source_amount(source))
+    content.update(id=source.get("id"), category=category(source, source_kind=source_kind), event_date=event_date(source),
+                   source_amount=source_amount(source), **cashflow_facts(source, source_kind=source_kind))
     return content
 
 
@@ -141,20 +245,26 @@ def register_inventory(state: dict[str, Any], inventory: dict[str, Any],
     """Register all sources, including confirmed IDs, without touching decisions."""
     sources = [(kind, source) for plural, kind in (("transactions", "transaction"), ("receipts", "receipt"))
                for source in inventory.get(plural) or []]
-    projections = [(f"{kind}:{source['id']}:basic", fingerprint(source), base_facts(source))
+    projections = [(f"{kind}:{source['id']}:basic", fingerprint(source), base_facts(source, source_kind=kind))
                    for kind, source in sources]
     summary = {"counts": {kind: len(inventory.get(kind) or []) for kind in ("transactions", "receipts")},
-               "category_counts": {kind: dict(Counter(category(item) for item in inventory.get(kind) or []))
+               "category_counts": {kind: dict(Counter(category(item, source_kind=kind[:-1]) for item in inventory.get(kind) or []))
                                    for kind in ("transactions", "receipts")},
+               "cashflow_lane_counts": {kind: dict(Counter(cashflow_facts(item, source_kind=kind[:-1])["cashflow_lane"] for item in inventory.get(kind) or []))
+                                        for kind in ("transactions", "receipts")},
                "purpose": "deterministic_cache_only", "include_in_model_prompt": False,
-               "ordering": "category/currency/actual_event_date; unknown_last; ties_retained"}
+               "ordering": "cashflow_lane/currency/actual_event_date/category/type; unknown_last; ties_retained; no_id_tiebreak"}
     seed = {"id": SEED_PLAYBOOK_ID, "strategy_order": SEED_STRATEGY_ORDER,
             "objectives": SEED_OBJECTIVES, "origin": "planner_seed", "status_source": "deterministic",
             "not_model_output": True}
-    index = sorted([{"source_key": key, "id": fact["id"], "category": fact["category"],
-                     "currency": fact.get("currency"), "amount": fact["source_amount"], "event_date": fact["event_date"]}
-                    for key, _, fact in projections],
-                   key=lambda item: (item["category"], str(item["currency"]), not item["event_date"], item["event_date"], str(item["id"])))
+    index = sorted(
+        [{"source_key": key, "id": fact["id"], "category": fact["category"], "type": fact.get("type"),
+          "cashflow_lane": fact["cashflow_lane"], "signed_cashflow_amount": fact["signed_cashflow_amount"],
+          "currency": fact.get("currency"), "amount": fact["source_amount"], "event_date": fact["event_date"]}
+         for key, _, fact in projections],
+        key=lambda item: ({"in": 0, "out": 1, "unknown": 2}[item["cashflow_lane"]], str(item["currency"] or ""),
+                          not item["event_date"], item["event_date"], item["category"], str(item["type"] or "")),
+    )
     inventory_hash = fingerprint([(key, source_hash) for key, source_hash, _ in projections])
     for owner in OWNERS:
         book = state["notebooks"][owner]
@@ -162,7 +272,7 @@ def register_inventory(state: dict[str, Any], inventory: dict[str, Any],
 
         def put(key: str, kind: str, content: Any, source_hash: str) -> None:
             old = entries.get(key)
-            if old and old["source_fingerprint"] == source_hash:
+            if old and old["source_fingerprint"] == source_hash and old["content"] == content:
                 return
             entry = {"key": key, "kind": kind, "content": deepcopy(content), "source_fingerprint": source_hash}
             probe = {**book, "entries": [entry], "used_bytes": 0}

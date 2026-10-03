@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -120,12 +121,16 @@ FINANCIAL_FACTS_SCHEMA: dict[str, Any] = {
             "type": "array", "items": {
                 "type": "object", "additionalProperties": False,
                 "properties": {
-                    "role": {"type": "string", "enum": ["total", "card", "cash", "swish", "fee", "settlement", "other"]},
+                    "role": {"type": "string", "enum": ["total", "card", "cash", "swish", "fee", "settlement", "other", "bank_transfer", "mobile_payment", "wallet"]},
                     "amount_decimal": {"type": "string"},
                     "label": {"type": "string"},
                     "currency": {"type": ["string", "null"]},
+                    "transaction_count": {
+                        "type": ["integer", "null"], "minimum": 0,
+                        "description": "Explicit parenthesized channel transaction count visible in label, e.g. Swish(2); otherwise null, never inferred.",
+                    },
                 },
-                "required": ["role", "amount_decimal", "label", "currency"],
+                "required": ["role", "amount_decimal", "label", "currency", "transaction_count"],
             },
         },
         "payer": PARTY_SCHEMA,
@@ -523,6 +528,16 @@ class OpenAIVisionClient:
                     "keep the full receipt total as amount_decimal. Never invent a fee or mix unrelated "
                     "totals. Include sales day/period and labelled payment breakdown in the short receipt "
                     "text even when payment_candidates is capped at three. "
+                    "Payment-channel totals are components of the main gross/final receipt total, not "
+                    "additional gross revenue: never count the same gross amount twice. Extract every "
+                    "explicitly labelled additional payment channel, including bank_transfer, mobile_payment "
+                    "and wallet; retain other channel labels under other when no role fits. Do not truncate "
+                    "amount_components or discard financial fields to fit the short text. For each component "
+                    "set transaction_count to an integer only when the source explicitly shows a parenthesized "
+                    "transaction count beside that channel, such as Swish(2); retain the exact visible label "
+                    "including (2) as source evidence. Otherwise transaction_count=null. Never infer counts "
+                    "or payment channels from a bank account, phone number, document brand, company name, "
+                    "amount ratios or matching transactions. These rules apply generically to all companies. "
                     "Do not transcribe advertisements, "
                     "terms, policies, explanatory prose, or full transaction tables. "
                     + (
@@ -825,6 +840,21 @@ class OpenAIVisionClient:
                 page_start = page_end = 1
             receipt_facts = raw_receipt.get("financial_facts")
             receipt_facts = receipt_facts if isinstance(receipt_facts, dict) else {}
+            # Historical components without count remain valid. For new counts,
+            # the complete visible label is evidence; never infer a missing count
+            # or trim components/financial fields to the short-text budget.
+            components = receipt_facts.get("amount_components")
+            if isinstance(components, list):
+                normalized_components = []
+                for component in components:
+                    if isinstance(component, dict) and "transaction_count" in component:
+                        component = dict(component)
+                        count = component["transaction_count"]
+                        visible = re.findall(r"\(\s*([0-9]+)\s*\)", str(component.get("label") or ""))
+                        if type(count) is not int or count < 0 or str(count) not in visible:
+                            component["transaction_count"] = None
+                    normalized_components.append(component)
+                receipt_facts = {**receipt_facts, "amount_components": normalized_components}
             receipt_classification = raw_receipt.get("classification")
             source_pages = sorted({
                 value for value in (raw_receipt.get("source_pages") or list(range(page_start, page_end + 1)))

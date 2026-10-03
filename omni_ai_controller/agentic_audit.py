@@ -22,7 +22,7 @@ from .audit_notebooks import (
     AuditNotebooks, OPERATIONS, candidate_receipts, category, confirmed_ids,
     event_date, fingerprint,
 )
-from .audit_inventory import SEED_OBJECTIVES
+from .audit_inventory import SEED_OBJECTIVES, cashflow_facts, cashflow_sort_key, partition_cashflow
 
 
 SEED_PLAYBOOK_ID = "accounting-expense-first-v1"
@@ -49,6 +49,7 @@ MAX_PLANNER_INPUT_TOKENS, MAX_WORKER_CHUNK_TOKENS, MAX_AGENT_INPUT_TOKENS = _aud
 )
 MAX_WORKER_CHUNK_CANDIDATES = 4
 MAX_WORKER_CHUNK_TRANSACTIONS = 2
+MAX_CHANNEL_GROUP_TRANSACTIONS = 4  # One indivisible group, not a global batch increase.
 MAX_AGENTIC_CHUNKS = 128
 MAX_AGENT_RETRY_OUTPUT_TOKENS = 8192
 MAX_AGENT_STEP_SECONDS = 240
@@ -165,6 +166,20 @@ def _alias_candidates(items: list[dict[str, Any]], aliases: dict[str, dict[str, 
             mapped["receipt_upload_id"] = _alias_receipt_id(mapped.get("receipt_upload_id"), aliases)
         if isinstance(mapped.get("receipt_upload_ids"), list):
             mapped["receipt_upload_ids"] = [_alias_receipt_id(value, aliases) for value in mapped["receipt_upload_ids"]]
+        evidence = mapped.get("evidence")
+        if isinstance(evidence, dict):
+            # Evidence scopes must use the same stable aliases as the outer row.
+            def alias_scope(value: Any, field: str = "") -> Any:
+                if isinstance(value, dict):
+                    return {key: alias_scope(child, key) for key, child in value.items()}
+                if isinstance(value, list):
+                    return [alias_scope(child, field) for child in value]
+                if field in ("transaction_id", "transaction_ids", "group_transaction_ids", "shared_transaction_ids"):
+                    return _alias_transaction_id(value, aliases)
+                if field in ("receipt_id", "receipt_upload_id", "receipt_upload_ids"):
+                    return _alias_receipt_id(value, aliases)
+                return value
+            mapped["evidence"] = alias_scope(evidence)
         result.append(mapped)
     return result
 
@@ -563,6 +578,15 @@ _FINAL_SYSTEM_PROMPT = """你是审计指挥智能体“李师傅”，现在评
 最终所有 recommendations 必须在 kernel 候选中并有 observations 覆盖；group_id 对应的组必须完整，不混合不同组或重复凭证。员工报销无证据不能凑单；工资差额仅 suspected，不必定是发票错误。cache_notes 是假设，不是规则。
 所有流水/小票 ID 使用输入中的紧凑编号（T001…/R001…），不要输出原始长 ID。只返回符合 JSON Schema 的对象。"""
 
+_PAYMENT_CHANNEL_RULE = """通用支付通道规则：只评估内核提供的完整 income_payment_channel 组。
+group_transaction_ids/group_row_count 是实际银行行数（2至4），不是卡支付客户笔数；聚合卡入账可为1行，Swish可为最多3行。
+显式通道金额和笔数、聚合银行金额、相邻实际时间及全局唯一完整分配联合构成证明；手机号仅是联合提示，门店名称不能单独证明支付渠道。
+内核确认的0至3日结算延迟或局部时间重排无需逐项解释税费、费率及其他差额构成；不能自行重排或重算。
+同组银行行可共用同一原始子票，这不是重复凭证；必须覆盖原始完整子票集合和全部银行行，不能省略、拆组、跨组或混合 match/suggest。
+未知方向或通道、内核 automatic_confirmation_blocked、非全局唯一或缺失完整证明的组只能整组建议，不能自动确认。"""
+_WORKER_SYSTEM_PROMPT += "\n" + _PAYMENT_CHANNEL_RULE
+_FINAL_SYSTEM_PROMPT += "\n" + _PAYMENT_CHANNEL_RULE
+
 
 def _planner_inventory_summary(context: dict[str, Any]) -> dict[str, Any]:
     """Project transport metadata, never forward an upstream seed/notebook.
@@ -589,7 +613,7 @@ def _planner_inventory_summary(context: dict[str, Any]) -> dict[str, Any]:
             counts.setdefault(kind, len(context.get(kind) or []))
     return {"counts": counts, "category_counts": category_counts,
             "purpose": "deterministic_cache_only", "include_in_model_prompt": False,
-            "ordering": "category/currency/actual_event_date; unknown_last; ties_retained",
+            "ordering": "cashflow_lane/currency/actual_event_date/category/type; unknown_last; ties_retained",
             "access": "organize covers all canonical sources; workers retrieve complete kernel scopes"}
 
 
@@ -735,6 +759,67 @@ def _ensure_input_budget(system_prompt: str, user_prompt: str, maximum: int) -> 
         raise AuditSkillError("智能体输入超过本地模型安全令牌预算，请缩小候选范围")
 
 
+def _group_id(item: dict[str, Any]) -> str:
+    return str(item.get("group_id") or item.get("match_group_id") or "")
+
+
+def _is_channel(item: dict[str, Any]) -> bool:
+    evidence = item.get("evidence") or {}
+    return (item.get("allocation_role") == "income_payment_channel"
+            or isinstance(evidence, dict) and evidence.get("method") == "income_payment_channels_v1")
+
+
+def _channel_groups(candidates: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    keys = {_group_id(item) for item in candidates if _is_channel(item)}
+    return {key: [item for item in candidates if _group_id(item) == key] for key in keys}
+
+
+def _complete_channel_group(members: list[dict[str, Any]]) -> bool:
+    actual = [str(item.get("transaction_id") or "") for item in members]
+    childsets = {frozenset(candidate_receipts(item)) for item in members}
+    if (not 2 <= len(actual) <= MAX_CHANNEL_GROUP_TRANSACTIONS or not all(actual)
+            or len(set(actual)) != len(actual) or len(childsets) != 1
+            or len(next(iter(childsets))) != 1):
+        return False
+    for item in members:
+        evidence = item.get("evidence")
+        if not isinstance(evidence, dict):
+            return False
+        declared = evidence.get("group_transaction_ids")
+        if (not _group_id(item) or item.get("allocation_role") != "income_payment_channel"
+                or evidence.get("method") != "income_payment_channels_v1"
+                or evidence.get("atomic_group") is not True or evidence.get("complete_receipt_group") is not True
+                or type(evidence.get("group_row_count")) is not int or evidence["group_row_count"] != len(actual)
+                or not isinstance(declared, list) or not all(isinstance(value, str) for value in declared)
+                or len(declared) != len(actual) or set(declared) != set(actual)):
+            return False
+    return True
+
+
+def _candidate_units(candidates: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Union transaction alternatives AND group members; never split an entity."""
+    parents: dict[str, str] = {}
+
+    def root(value: str) -> str:
+        parents.setdefault(value, value)
+        while parents[value] != value:
+            parents[value] = parents[parents[value]]
+            value = parents[value]
+        return value
+
+    for item in candidates:
+        tx = "tx:" + str(item.get("transaction_id") or "")
+        group = _group_id(item)
+        if group:
+            parents[root("group:" + group)] = root(tx)
+        else:
+            root(tx)
+    units: dict[str, list[dict[str, Any]]] = {}
+    for item in candidates:
+        units.setdefault(root("tx:" + str(item.get("transaction_id") or "")), []).append(item)
+    return list(units.values())
+
+
 def _worker_chunks(context: dict[str, Any]) -> list[dict[str, Any]]:
     excluded_transactions, excluded_receipts = confirmed_ids(context)
     inventory = context.get("source_inventory") or {}
@@ -752,13 +837,13 @@ def _worker_chunks(context: dict[str, Any]) -> list[dict[str, Any]]:
         for item in (context.get("receipts") or [])
         if isinstance(item, dict) and item.get("id")
     }
-    groups: dict[str, list[dict[str, Any]]] = {}
+    eligible: list[dict[str, Any]] = []
     source_candidates = [
         {**item, "group_id": item.get("group_id") or item.get("match_group_id")}
         for item in context.get("deterministic_candidates") or [] if isinstance(item, dict)
     ]
     excluded_groups = {
-        (str(item.get("transaction_id")), str(item.get("group_id")))
+        _group_id(item)
         for item in source_candidates if item.get("group_id") and (
             str(item.get("transaction_id")) not in transactions
             or str(item.get("transaction_id")) in excluded_transactions
@@ -766,21 +851,28 @@ def _worker_chunks(context: dict[str, Any]) -> list[dict[str, Any]]:
             or candidate_receipts(item) & excluded_receipts
         )
     }
+    invalid_channels = {key for key, members in _channel_groups(source_candidates).items()
+                        if not _complete_channel_group(members)}
+    excluded_groups.update(invalid_channels)
     for candidate in source_candidates:
         transaction_id = str(candidate.get("transaction_id") or "")
-        if (transaction_id, str(candidate.get("group_id"))) in excluded_groups:
+        if (_group_id(candidate) and _group_id(candidate) in excluded_groups) or (_is_channel(candidate) and not _group_id(candidate)):
             continue  # Never turn a partially excluded group into a smaller one.
         if transaction_id not in transactions or not candidate_receipts(candidate).issubset(receipts):
             continue
         if transaction_id in excluded_transactions or candidate_receipts(candidate) & excluded_receipts:
             continue
-        groups.setdefault(transaction_id, []).append(candidate)
+        eligible.append(candidate)
+
+    lanes = partition_cashflow(list(transactions.values()), source_kind="transaction")
+    transactions = {str(item["id"]): item for rows in lanes.values() for item in rows}
 
     base = {
         "strategy": context.get("strategy"),
         "iteration": context.get("iteration") or {},
         "profile": context.get("profile") or {},
         "active_skills": _prompt_skills(context, "evidence_worker"),
+        "blocked_channel_groups": sorted(invalid_channels),
     }
 
     def build(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -788,9 +880,10 @@ def _worker_chunks(context: dict[str, Any]) -> list[dict[str, Any]]:
         receipt_ids = set().union(*(candidate_receipts(item) for item in candidates))
         result = {
             **base,
-            "transactions": [transactions[value] for value in sorted(transaction_ids) if value in transactions],
-            "receipts": [receipts[value] for value in sorted(receipt_ids) if value in receipts],
+            "transactions": sorted([transactions[value] for value in transactions if value in transaction_ids], key=cashflow_sort_key),
+            "receipts": sorted([receipts[value] for value in receipts if value in receipt_ids], key=cashflow_sort_key),
             "deterministic_candidates": candidates,
+            "cashflow_lane": transactions[next(iter(transaction_ids))]["cashflow_lane"],
         }
         if inventory_receipts:
             # Preserve the existing scoped OCR excerpt for on-demand detail
@@ -801,13 +894,20 @@ def _worker_chunks(context: dict[str, Any]) -> list[dict[str, Any]]:
 
     chunks: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
-    for group in sorted(groups.values(), key=lambda items: (
-        {"expense": 0, "refund": 1, "income": 2, "payroll": 3}.get(category(items[0]), 4),
-        event_date(transactions.get(str(items[0].get("transaction_id")), {})),
-    )):
+    units = _candidate_units(eligible)
+    units.sort(key=lambda items: min(cashflow_sort_key(transactions[str(item["transaction_id"])]) for item in items))
+    for group in units:
+        tx_ids = {str(item["transaction_id"]) for item in group}
+        group_lanes = {transactions[value]["cashflow_lane"] for value in tx_ids}
+        if len(group_lanes) != 1:
+            continue  # Contradictory atomic group: never process a half in either lane.
+        channel_unit = (len({_group_id(item) for item in group}) == 1 and all(_is_channel(item) for item in group))
+        if len(tx_ids) > MAX_WORKER_CHUNK_TRANSACTIONS and not (channel_unit and len(tx_ids) <= MAX_CHANNEL_GROUP_TRANSACTIONS):
+            continue  # Fail closed on unbounded/overlapping groups, keeping other units.
         proposed = build([*pending, *group])
         if pending and (
-            _estimated_tokens(_serialized(proposed)) > MAX_WORKER_CHUNK_TOKENS
+            build(pending)["cashflow_lane"] != next(iter(group_lanes))
+            or _estimated_tokens(_serialized(proposed)) > MAX_WORKER_CHUNK_TOKENS
             or len(pending) + len(group) > MAX_WORKER_CHUNK_CANDIDATES
             or len({str(item.get("transaction_id")) for item in [*pending, *group]}) > MAX_WORKER_CHUNK_TRANSACTIONS
         ):
@@ -959,16 +1059,14 @@ def _request_agent(
 
 
 def _split_worker_chunk(chunk: dict[str, Any]) -> list[dict[str, Any]]:
-    """Split only between transactions: reimbursement groups stay complete."""
-    transaction_ids = list(dict.fromkeys(
-        str(item.get("transaction_id") or "")
-        for item in chunk["deterministic_candidates"]
-    ))
-    if len(transaction_ids) < 2:
+    """Recovery uses the same indivisible units as initial/cache processing."""
+    units = _candidate_units(chunk["deterministic_candidates"])
+    if len(units) < 2:
         return []
-    midpoint = len(transaction_ids) // 2
+    midpoint = len(units) // 2
     children = []
-    for ids in (set(transaction_ids[:midpoint]), set(transaction_ids[midpoint:])):
+    for part in (units[:midpoint], units[midpoint:]):
+        ids = {str(item["transaction_id"]) for unit in part for item in unit}
         candidates = [item for item in chunk["deterministic_candidates"] if str(item.get("transaction_id") or "") in ids]
         receipt_ids = set().union(*(candidate_receipts(item) for item in candidates))
         children.append({
@@ -992,7 +1090,11 @@ def _split_worker_chunk(chunk: dict[str, Any]) -> list[dict[str, Any]]:
 def _kernel_relations(chunk: dict[str, Any]) -> set[tuple[str, frozenset[str], str | None]]:
     groups: dict[tuple[str, str], set[str]] = {}
     relations = set()
+    invalid = {key for key, members in _channel_groups(chunk["deterministic_candidates"]).items()
+               if not _complete_channel_group(members)}
     for item in chunk["deterministic_candidates"]:
+        if _group_id(item) in invalid:
+            continue
         transaction = str(item.get("transaction_id") or "")
         receipts = candidate_receipts(item)
         group_id = str(item.get("group_id") or item.get("match_group_id") or "")
@@ -1062,10 +1164,45 @@ def _approved_decisions(final: dict[str, Any], worker: dict[str, Any], chunk: di
                for item in observations}
     transactions = {tx for tx, _ in allowed}
     result = []
+    channel_groups = _channel_groups(chunk["deterministic_candidates"])
+    channel_transactions = {str(item["transaction_id"]) for members in channel_groups.values() for item in members}
+    decisions = [item for item in final.get("decisions") or [] if isinstance(item, dict)]
+    for members in channel_groups.values():
+        if not _complete_channel_group(members):
+            continue
+        txs = {str(item["transaction_id"]) for item in members}
+        ids = frozenset(candidate_receipts(members[0]))
+        selected = [item for item in decisions if str(item.get("transaction_id") or "") in txs]
+        if (len(selected) != len(txs) or {str(item.get("transaction_id")) for item in selected} != txs
+                or len({item.get("recommendation") for item in selected}) != 1
+                or txs & used_transactions or ids & used_receipts):
+            continue
+        recommendation = selected[0].get("recommendation")
+        if recommendation not in ("match", "suggest", "leave_unmatched"):
+            continue
+        if any(not isinstance(item.get("receipt_upload_ids"), list)
+               or item["receipt_upload_ids"] != sorted(ids) for item in selected):
+            continue
+        group = _group_id(members[0])
+        if any((str(item["transaction_id"]), ids) not in covered
+               or covered[(str(item["transaction_id"]), ids)].get("group_id") != group for item in selected):
+            continue
+        if recommendation == "match":
+            if any(not _relation_cashflow_known(chunk, str(item["transaction_id"]), ids) for item in selected):
+                continue
+            if any(not _channel_proven(item) for item in members):
+                continue
+            if any(not _match_evidence(item, covered[(str(item["transaction_id"]), ids)]) for item in selected):
+                continue
+        used_transactions.update(txs)
+        used_receipts.update(ids)  # Reserve original child once for the entire group.
+        result.extend(selected)
     for decision in final.get("decisions") or []:
         if not isinstance(decision, dict) or decision.get("recommendation") not in ("match", "suggest", "leave_unmatched"):
             continue
         tx = str(decision.get("transaction_id") or "")
+        if tx in channel_transactions:
+            continue  # No single-row fallback for rejected/partial channel groups.
         raw_ids = decision.get("receipt_upload_ids") or []
         if not isinstance(raw_ids, list) or not all(isinstance(value, str) for value in raw_ids) or len(set(raw_ids)) != len(raw_ids):
             continue
@@ -1076,10 +1213,7 @@ def _approved_decisions(final: dict[str, Any], worker: dict[str, Any], chunk: di
             continue
         if decision["recommendation"] == "match":
             observation = covered.get((tx, ids)) or {}
-            confidence = decision.get("confidence")
-            if (not ids or not isinstance(confidence, (float, int)) or isinstance(confidence, bool)
-                    or not .88 <= confidence <= 1 or observation.get("unresolved")
-                    or not observation.get("finding") or not any(observation.get("evidence") or [])):
+            if not ids or not _relation_cashflow_known(chunk, tx, ids) or not _match_evidence(decision, observation):
                 continue
         used_transactions.add(tx)
         used_receipts.update(ids)
@@ -1087,8 +1221,33 @@ def _approved_decisions(final: dict[str, Any], worker: dict[str, Any], chunk: di
     return result
 
 
+def _match_evidence(decision: dict[str, Any], observation: dict[str, Any]) -> bool:
+    confidence = decision.get("confidence")
+    return (isinstance(confidence, (float, int)) and not isinstance(confidence, bool)
+            and .88 <= confidence <= 1 and not observation.get("unresolved")
+            and bool(observation.get("finding")) and any(observation.get("evidence") or []))
+
+
+def _relation_cashflow_known(chunk: dict[str, Any], tx: str, ids: frozenset[str]) -> bool:
+    transaction = next((item for item in chunk.get("transactions") or [] if str(item.get("id")) == tx), {})
+    lane = cashflow_facts(transaction, source_kind="transaction")["cashflow_lane"]
+    receipts = [item for item in chunk.get("receipts") or [] if str(item.get("id")) in ids]
+    return (lane != "unknown" and len(receipts) == len(ids)
+            and all(cashflow_facts(item, source_kind="receipt")["cashflow_lane"] == lane for item in receipts))
+
+
+def _channel_proven(item: dict[str, Any]) -> bool:
+    evidence = item["evidence"]
+    return (evidence.get("automatic_confirmation_blocked") is False
+            and evidence.get("globally_unambiguous") is True
+            and evidence.get("channel") in ("card", "swish")
+            and evidence.get("confirmation_basis") == "complete_channels_globally_forced")
+
+
 def _strategy(candidate: dict[str, Any]) -> str:
     role = str(candidate.get("allocation_role") or "")
+    if role == "income_payment_channel":
+        return "revenue_settlements"
     if "reimbursement" in role or "payroll" in role:
         return "employee_reimbursements"
     if category(candidate) == "income":
@@ -1098,6 +1257,27 @@ def _strategy(candidate: dict[str, Any]) -> str:
     if "anomaly" in role:
         return "anomaly_review"
     return "direct_expenses"
+
+
+def _worker_scope(candidates: list[dict[str, Any]], raw: dict[str, Any]) -> list[dict[str, Any]]:
+    selected = [item for item in candidates if _strategy(item) == str(raw.get("strategy") or "direct_expenses")]
+    if raw.get("transaction_ids"):
+        selected = [item for item in candidates if str(item.get("transaction_id")) in raw["transaction_ids"]]
+    if raw.get("receipt_ids"):
+        selected = [item for item in selected if candidate_receipts(item).issubset(set(raw["receipt_ids"]))]
+    # Selecting any bank row selects the complete original channel group.
+    channel_keys = {_group_id(item) for item in selected if _is_channel(item)}
+    selected_keys = {fingerprint(item) for item in selected}
+    selected = [item for item in candidates if fingerprint(item) in selected_keys or _group_id(item) in channel_keys]
+    full = {(tx, group): ids for tx, ids, group in _kernel_relations({"deterministic_candidates": candidates}) if group}
+    scoped = {(tx, group): ids for tx, ids, group in _kernel_relations({"deterministic_candidates": selected}) if group}
+    return [item for item in selected if not _group_id(item) or
+            scoped.get((str(item["transaction_id"]), _group_id(item))) == full.get((str(item["transaction_id"]), _group_id(item)))]
+
+
+def _derived_worker_chunks(context: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # All four bank rows and the complete evidence are budgeted together.
+    return _worker_chunks({**context, "deterministic_candidates": candidates})
 
 
 def _scoped_jobs(plan: dict[str, Any], context: dict[str, Any], notebooks: AuditNotebooks) -> list[dict[str, Any]]:
@@ -1116,17 +1296,7 @@ def _scoped_jobs(plan: dict[str, Any], context: dict[str, Any], notebooks: Audit
                 {**raw, "task_id": str(raw.get("task_id") or f"task-{index + 1}")},
                 iteration=(context.get("iteration") or {}).get("number", 1))
         strategy = str(raw.get("strategy") or "direct_expenses")
-        selected = [item for item in candidates if _strategy(item) == strategy]
-        if raw.get("transaction_ids"):
-            selected = [item for item in candidates if str(item.get("transaction_id")) in raw["transaction_ids"]]
-        if raw.get("receipt_ids"):
-            selected = [item for item in selected if candidate_receipts(item).issubset(set(raw["receipt_ids"]))]
-        # Scope cannot slice a kernel group. Drop the whole incomplete group.
-        full_groups = {(tx, group): ids for tx, ids, group in _kernel_relations({"deterministic_candidates": candidates}) if group}
-        selected_groups = {(tx, group): ids for tx, ids, group in _kernel_relations({"deterministic_candidates": selected}) if group}
-        selected = [item for item in selected if not item.get("group_id") or
-                    selected_groups.get((str(item.get("transaction_id")), str(item["group_id"]))) ==
-                    full_groups.get((str(item.get("transaction_id")), str(item["group_id"])))]
+        selected = _worker_scope(candidates, raw)
         operation = raw.get("operation") or ("review_anomaly" if strategy == "anomaly_review" else
                      "compare_details" if strategy in ("revenue_settlements", "employee_reimbursements") else "search_amount")
         if operation not in OPERATIONS:
@@ -1164,7 +1334,7 @@ def _scoped_jobs(plan: dict[str, Any], context: dict[str, Any], notebooks: Audit
         pending.remove(ready)
         task = {key: value for key, value in ready.items() if key != "candidates"}
         notebooks.task("audit_planner", task, "pending")
-        for chunk in _worker_chunks({**context, "deterministic_candidates": ready["candidates"]}):
+        for chunk in _derived_worker_chunks(context, ready["candidates"]):
             scoped = {**task, "transaction_ids": [str(item["id"]) for item in chunk["transactions"]],
                       "receipt_ids": [str(item["id"]) for item in chunk["receipts"]]}
             scoped["task_id"] = task["task_id"] + ":" + fingerprint({key: scoped[key] for key in ("operation", "transaction_ids", "receipt_ids", "amount")})[:16]
@@ -1230,6 +1400,26 @@ def _planner_payload(
     planner_user_prompt = prompt()
     _ensure_input_budget(_PLANNER_SYSTEM_PROMPT, planner_user_prompt, MAX_PLANNER_INPUT_TOKENS)
     return summary, planner_user_prompt
+
+
+def _final_prompts(audit_id: str, summary: dict[str, Any], chunk: dict[str, Any], worker: dict[str, Any],
+                   aliases: dict[str, dict[str, str]], index: int, count: int) -> str:
+    final_input = {
+        "summary": {key: value for key, value in summary.items() if key != "scope_catalog"},
+        "tasks": _alias_tasks(chunk["tasks"], aliases),
+        "cashflow_lane": chunk["cashflow_lane"],
+        "kernel_candidates": _alias_candidates(chunk["deterministic_candidates"], aliases),
+        "batch": {"index": index, "count": count},
+        "worker_result": _worker_result_for_model(worker, aliases),
+    }
+    prompt = f"审计编号：{audit_id}\n请评估本分片：\n<agent_results>{_serialized(final_input)}</agent_results>"
+    _ensure_input_budget(_FINAL_SYSTEM_PROMPT, prompt, MAX_AGENT_INPUT_TOKENS)
+    return prompt
+
+
+def _validate_response(final: dict[str, Any], worker: dict[str, Any], chunk: dict[str, Any],
+                       used_receipts: set[str], used_transactions: set[str]) -> list[dict[str, Any]]:
+    return _approved_decisions(final, worker, chunk, used_receipts, used_transactions)
 
 
 def _analyze_agentic_audit(
@@ -1353,13 +1543,13 @@ def _analyze_agentic_audit(
             while batch_index <= len(chunks):
                 check_active()
                 chunk = chunks[batch_index - 1]
-                excluded_groups = {(str(item.get("transaction_id")), str(item.get("group_id"))) for item in chunk["deterministic_candidates"]
+                excluded_groups = {_group_id(item) for item in chunk["deterministic_candidates"]
                                    if item.get("group_id") and (str(item.get("transaction_id")) in locked_transactions
                                                               or candidate_receipts(item) & locked_receipts)}
                 remaining_candidates = [item for item in chunk["deterministic_candidates"]
                                         if str(item.get("transaction_id")) not in locked_transactions
                                         and not candidate_receipts(item) & locked_receipts
-                                        and (str(item.get("transaction_id")), str(item.get("group_id"))) not in excluded_groups]
+                                        and _group_id(item) not in excluded_groups]
                 if not remaining_candidates:
                     if prepared_future is not None and prepared_key == chunk_key(chunk):
                         prepared_future.result()
@@ -1405,6 +1595,11 @@ def _analyze_agentic_audit(
                     prepared_future = None
                     prepared_key = None
                     check_active()
+                    # Cache facts remain canonical. Prompt retrieval stays lane/event
+                    # ordered even when the notebook's legacy category order differs.
+                    prepared = {**prepared,
+                                "transaction_facts": sorted(prepared["transaction_facts"], key=cashflow_sort_key),
+                                "receipt_facts": sorted(prepared["receipt_facts"], key=cashflow_sort_key)}
                     worker_document = _serialized({
                         **{key: value for key, value in {
                             **chunk,
@@ -1468,20 +1663,7 @@ def _analyze_agentic_audit(
                         prepared_key = chunk_key(next_chunk)
                         prepared_future = executor.submit(copy_context().run, notebooks.prepare, next_chunk, next_chunk["tasks"], stopped)
 
-                final_input = {
-                    "summary": {key: value for key, value in summary.items() if key != "scope_catalog"},
-                    "tasks": _alias_tasks(chunk["tasks"], aliases),
-                    "kernel_candidates": _alias_candidates(chunk["deterministic_candidates"], aliases),
-                    "batch": {"index": batch_index, "count": len(chunks)},
-                    "worker_result": _worker_result_for_model(worker, aliases),
-                }
-                final_user_prompt = (
-                    f"审计编号：{audit_id}\n请评估本分片：\n"
-                    f"<agent_results>{_serialized(final_input)}</agent_results>"
-                )
-                _ensure_input_budget(
-                    _FINAL_SYSTEM_PROMPT, final_user_prompt, MAX_AGENT_INPUT_TOKENS
-                )
+                final_user_prompt = _final_prompts(audit_id, summary, chunk, worker, aliases, batch_index, len(chunks))
                 _publish_progress(run_id, stage="final_assessment", agent_kind="audit_planner")
                 for task in chunk["tasks"]:
                     notebooks.task("audit_planner", approval_task(task), "running")
@@ -1502,7 +1684,7 @@ def _analyze_agentic_audit(
                         batch_index += 1
                     continue
                 final = _final_to_real(final_raw, aliases)
-                final["decisions"] = _approved_decisions(final, worker, chunk, used_receipts, used_transactions)
+                final["decisions"] = _validate_response(final, worker, chunk, used_receipts, used_transactions)
                 for decision in final["decisions"]:
                     if decision["recommendation"] == "match":
                         locked_transactions.add(str(decision["transaction_id"]))
