@@ -450,3 +450,341 @@ def test_parent_cancellation_preserves_approvals_and_skips_remaining_tasks(monke
     assert result["error_code"] == "agentic_cancelled"
     assert result["result"]["decisions"] == [decision]
     assert len(client.calls) == 3
+
+
+def test_model_prompts_use_short_codes_and_restore_real_ids() -> None:
+    transaction_id = "6f06d153-04ce-4ba6-8870-36efce455f8d"
+    receipt_id = "f81f6dd0-c0d2-4f58-b7f0-cf00f66ec2b0"
+    worker = {
+        **_worker(),
+        "observations": [{
+            "transaction_id": "T001",
+            "receipt_upload_ids": ["R001"],
+            "group_id": None,
+            "finding": "金额一致",
+            "evidence": ["精确金额唯一"],
+            "unresolved": [],
+        }],
+    }
+    final = {
+        **_final(),
+        "decisions": [{
+            "transaction_id": "T001",
+            "receipt_upload_ids": ["R001"],
+            "recommendation": "match",
+            "confidence": 0.95,
+        }],
+    }
+    context = {
+        "transactions": [{"id": transaction_id}],
+        "receipts": [{"id": receipt_id}],
+        "deterministic_candidates": [{
+            "transaction_id": transaction_id,
+            "receipt_upload_id": receipt_id,
+        }],
+    }
+
+    client = FakeClient([_plan(), worker, final])
+    result = analyze_agentic_audit(client, audit_id="alias-case", context=context)
+
+    assert result["result"]["decisions"] == [{
+        "transaction_id": transaction_id,
+        "receipt_upload_ids": [receipt_id],
+        "recommendation": "match",
+        "confidence": 0.95,
+    }]
+    planner_payload = str(client.calls[0]["messages"][1]["content"])
+    worker_payload = str(client.calls[1]["messages"][1]["content"])
+    final_payload = str(client.calls[2]["messages"][1]["content"])
+    assert "T001" in planner_payload and "R001" in planner_payload
+    assert transaction_id not in worker_payload and receipt_id not in worker_payload
+    assert "T001" in worker_payload and "R001" in worker_payload
+    assert transaction_id not in final_payload and receipt_id not in final_payload
+    assert "T001" in final_payload and "R001" in final_payload
+
+
+def test_income_match_can_disclose_unitemized_difference_without_blocking_relation() -> None:
+    decision = {
+        "transaction_id": "tx",
+        "receipt_upload_ids": ["receipt"],
+        "recommendation": "match",
+        "confidence": 0.92,
+    }
+    worker = {
+        **_worker(),
+        "observations": [{
+            "transaction_id": "tx",
+            "receipt_upload_ids": ["receipt"],
+            "group_id": None,
+            "finding": "交易净额与收入日报毛额存在处理商抽成差额",
+            "evidence": ["金额差额稳定", "日期角色一致"],
+            "unresolved": [],  # Missing breakdown is disclosure, not a relationship conflict.
+        }],
+    }
+    context = {
+        "transactions": [{"id": "tx"}],
+        "receipts": [{"id": "receipt"}],
+        "deterministic_candidates": [{
+            "transaction_id": "tx",
+            "receipt_upload_id": "receipt",
+            "allocation_role": "income_settlement",
+            "category": "income",
+        }],
+    }
+
+    result = analyze_agentic_audit(
+        FakeClient([_plan(), worker, {**_final(), "decisions": [decision]}]),
+        audit_id="income-fee-allowed",
+        context=context,
+    )
+    assert result["result"]["decisions"] == [decision]
+
+
+def test_income_fee_words_do_not_bypass_actual_unresolved_conflicts() -> None:
+    decision = {
+        "transaction_id": "tx",
+        "receipt_upload_ids": ["receipt"],
+        "recommendation": "match",
+        "confidence": 0.99,
+    }
+    worker = {
+        **_worker(),
+        "observations": [{
+            "transaction_id": "tx",
+            "receipt_upload_ids": ["receipt"],
+            "group_id": None,
+            "finding": "存在处理商结算抽成差额",
+            "evidence": ["金额链路完整"],
+            "unresolved": ["手续费可能存在，但结算日期矛盾，币种不符"],
+        }],
+    }
+    context = {
+        "transactions": [{"id": "tx"}],
+        "receipts": [{"id": "receipt"}],
+        "deterministic_candidates": [{
+            "transaction_id": "tx",
+            "receipt_upload_id": "receipt",
+            "allocation_role": "income_settlement",
+            "category": "income",
+        }],
+    }
+
+    result = analyze_agentic_audit(
+        FakeClient([_plan(), worker, {**_final(), "decisions": [decision]}]),
+        audit_id="income-fee-lower-confidence",
+        context=context,
+    )
+    assert result["result"]["decisions"] == []
+
+
+def test_unique_income_suggestion_is_not_silently_promoted_or_confidence_invented() -> None:
+    worker = {
+        **_worker(),
+        "observations": [{
+            "transaction_id": "tx",
+            "receipt_upload_ids": ["receipt"],
+            "group_id": None,
+            "finding": "收入净额与凭证毛额存在抽成差额",
+            "evidence": ["日期角色一致", "候选关系唯一"],
+            "unresolved": ["手续费拆分未逐项列示"],
+        }],
+    }
+    final = {
+        **_final(),
+        "decisions": [{
+            "transaction_id": "tx",
+            "receipt_upload_ids": ["receipt"],
+            "recommendation": "suggest",
+            "confidence": 0.86,
+        }],
+    }
+    context = {
+        "transactions": [{"id": "tx"}],
+        "receipts": [{"id": "receipt"}],
+        "deterministic_candidates": [{
+            "transaction_id": "tx",
+            "receipt_upload_id": "receipt",
+            "allocation_role": "income_settlement",
+            "category": "income",
+        }],
+    }
+
+    result = analyze_agentic_audit(
+        FakeClient([_plan(), worker, final]),
+        audit_id="income-auto-promote",
+        context=context,
+    )
+    assert result["result"]["decisions"] == final["decisions"]
+    assert result["result"]["decisions"][0]["recommendation"] == "suggest"
+    assert result["result"]["decisions"][0]["confidence"] == 0.86
+
+
+def test_income_suggest_not_promoted_when_multiple_candidates_exist() -> None:
+    worker = {
+        **_worker(),
+        "observations": [{
+            "transaction_id": "tx",
+            "receipt_upload_ids": ["receipt-1"],
+            "group_id": None,
+            "finding": "可解释但并非唯一候选",
+            "evidence": ["同日多张收入凭证"],
+            "unresolved": ["需在多候选中消歧"],
+        }],
+    }
+    final = {
+        **_final(),
+        "decisions": [{
+            "transaction_id": "tx",
+            "receipt_upload_ids": ["receipt-1"],
+            "recommendation": "suggest",
+            "confidence": 0.91,
+        }],
+    }
+    context = {
+        "transactions": [{"id": "tx"}],
+        "receipts": [{"id": "receipt-1"}, {"id": "receipt-2"}],
+        "deterministic_candidates": [
+            {
+                "transaction_id": "tx",
+                "receipt_upload_id": "receipt-1",
+                "allocation_role": "income_settlement",
+                "category": "income",
+            },
+            {
+                "transaction_id": "tx",
+                "receipt_upload_id": "receipt-2",
+                "allocation_role": "income_settlement",
+                "category": "income",
+            },
+        ],
+    }
+
+    result = analyze_agentic_audit(
+        FakeClient([_plan(), worker, final]),
+        audit_id="income-no-auto-promote",
+        context=context,
+    )
+    assert result["result"]["decisions"][0]["recommendation"] == "suggest"
+
+
+def test_chunk_local_date_order_without_amount_checks_cannot_promote_suggestions() -> None:
+    worker = {
+        **_worker(),
+        "observations": [
+            {
+                "transaction_id": "tx-1",
+                "receipt_upload_ids": ["receipt-1"],
+                "group_id": None,
+                "finding": "时间顺序与第一笔收入凭证一致，净额有抽成偏差",
+                "evidence": ["销售日与到账序列一致"],
+                "unresolved": ["含手续费和小费导致差额"],
+            },
+            {
+                "transaction_id": "tx-2",
+                "receipt_upload_ids": ["receipt-2"],
+                "group_id": None,
+                "finding": "时间顺序与第二笔收入凭证一致，净额有抽成偏差",
+                "evidence": ["销售日与到账序列一致"],
+                "unresolved": ["含手续费和小费导致差额"],
+            },
+        ],
+    }
+    final = {
+        **_final(),
+        "decisions": [
+            {
+                "transaction_id": "tx-1",
+                "receipt_upload_ids": ["receipt-1"],
+                "recommendation": "suggest",
+                "confidence": 0.84,
+            },
+            {
+                "transaction_id": "tx-2",
+                "receipt_upload_ids": ["receipt-2"],
+                "recommendation": "suggest",
+                "confidence": 0.85,
+            },
+        ],
+    }
+    context = {
+        "transactions": [
+            {"id": "tx-1", "event_date": "2026-09-01"},
+            {"id": "tx-2", "event_date": "2026-09-02"},
+        ],
+        "receipts": [
+            {"id": "receipt-1", "event_date": "2026-09-01"},
+            {"id": "receipt-2", "event_date": "2026-09-02"},
+        ],
+        "deterministic_candidates": [
+            {
+                "transaction_id": "tx-1",
+                "receipt_upload_id": "receipt-1",
+                "allocation_role": "income_settlement",
+                "category": "income",
+            },
+            {
+                "transaction_id": "tx-1",
+                "receipt_upload_id": "receipt-2",
+                "allocation_role": "income_settlement",
+                "category": "income",
+            },
+            {
+                "transaction_id": "tx-2",
+                "receipt_upload_id": "receipt-1",
+                "allocation_role": "income_settlement",
+                "category": "income",
+            },
+            {
+                "transaction_id": "tx-2",
+                "receipt_upload_id": "receipt-2",
+                "allocation_role": "income_settlement",
+                "category": "income",
+            },
+        ],
+    }
+
+    result = analyze_agentic_audit(
+        FakeClient([_plan(), worker, final]),
+        audit_id="income-time-order-promote",
+        context=context,
+    )
+    recommendations = [item["recommendation"] for item in result["result"]["decisions"]]
+    assert recommendations == ["suggest", "suggest"]
+    assert result["result"]["decisions"] == final["decisions"]
+
+
+def test_short_codes_remain_stable_after_confirmed_sources_leave_residual():
+    from omni_ai_controller.agentic_audit import _id_aliases
+
+    inventory = {"transactions": [{"id": "first"}, {"id": "second"}],
+                 "receipts": [{"id": "first-receipt"}, {"id": "second-receipt"}]}
+    initial = _id_aliases({"source_inventory": inventory, **inventory})
+    residual = _id_aliases({"source_inventory": inventory,
+        "transactions": [{"id": "second"}], "receipts": [{"id": "second-receipt"}]})
+    assert initial == residual
+    assert residual["tx_forward"]["second"] == "T002"
+    assert residual["receipt_forward"]["second-receipt"] == "R002"
+
+
+def test_short_codes_are_deterministic_without_full_inventory():
+    from omni_ai_controller.agentic_audit import _id_aliases
+
+    first = {"transactions": [{"id": "b"}, {"id": "a"}],
+             "receipts": [{"id": "y"}, {"id": "x"}]}
+    second = {"transactions": first["transactions"][::-1], "receipts": first["receipts"][::-1]}
+    assert _id_aliases(first) == _id_aliases(second)
+
+
+def test_all_agents_use_general_global_income_strategy_not_itemized_fee_requirement():
+    from omni_ai_controller.agentic_audit import (
+        _PLANNER_SYSTEM_PROMPT, _WORKER_SYSTEM_PROMPT, _FINAL_SYSTEM_PROMPT,
+    )
+
+    assert "每条待核流水" in _PLANNER_SYSTEM_PROMPT
+    assert "金额附近一对一最优解" in _PLANNER_SYSTEM_PROMPT
+    assert "具体构成不必逐项可得" in _WORKER_SYSTEM_PROMPT
+    assert "income_sequence" in _WORKER_SYSTEM_PROMPT
+    assert "同币种、同方向" in _FINAL_SYSTEM_PROMPT
+    assert "不能仅按第几条或本分片顺序硬配" in _FINAL_SYSTEM_PROMPT
+    assert "不依赖某一行业、店铺或预设平台费率" in _FINAL_SYSTEM_PROMPT
+

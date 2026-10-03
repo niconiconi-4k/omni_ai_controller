@@ -123,7 +123,7 @@ def test_scope_priority_dependency_and_legacy_defaults_are_actually_dispatched()
     prompts = [json.loads(call["messages"][1]["content"].split("<audit_data>")[1].split("</audit_data>")[0])
                for call in client.calls if call["schema_name"] == "ma_shifu_evidence_review"]
     assert [prompt["tasks"][0]["parent_task_id"] for prompt in prompts] == ["high", "low", "dependent"]
-    assert [prompt["tasks"][0]["transaction_ids"] for prompt in prompts] == [["t2"], ["t1"], ["t1"]]
+    assert [prompt["tasks"][0]["transaction_ids"] for prompt in prompts] == [["T002"], ["T001"], ["T001"]]
     assert prompts[1]["tasks"][0]["operation"] == "search_amount"
     assert prompts[2]["tasks"][0]["depends_on"] == ["low"]
     assert "李师傅计划" not in client.calls[1]["messages"][1]["content"]

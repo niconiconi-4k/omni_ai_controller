@@ -45,6 +45,201 @@ MAX_AGENT_STEP_SECONDS = 240
 MAX_AGENTIC_SECONDS = 2400
 
 
+def _alias_series(prefix: str, values: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    forward: dict[str, str] = {}
+    reverse: dict[str, str] = {}
+    for index, value in enumerate(values, start=1):
+        if value in forward:
+            continue
+        token = f"{prefix}{index:03d}"
+        forward[value] = token
+        reverse[token] = value
+    return forward, reverse
+
+
+def _id_aliases(context: dict[str, Any]) -> dict[str, dict[str, str]]:
+    transaction_ids: list[str] = []
+    receipt_ids: list[str] = []
+
+    def keep(items: list[str], value: Any) -> None:
+        text = str(value or "")
+        if text and text not in items:
+            items.append(text)
+
+    inventory = context.get("source_inventory") or {}
+    for plural, ids in (("transactions", transaction_ids), ("receipts", receipt_ids)):
+        for item in inventory.get(plural) or []:
+            if isinstance(item, dict):
+                keep(ids, item.get("id"))
+    for item in context.get("transactions") or []:
+        if isinstance(item, dict):
+            keep(transaction_ids, item.get("id"))
+    for item in context.get("receipts") or []:
+        if isinstance(item, dict):
+            keep(receipt_ids, item.get("id"))
+    for item in context.get("deterministic_candidates") or []:
+        if not isinstance(item, dict):
+            continue
+        keep(transaction_ids, item.get("transaction_id"))
+        for value in sorted(candidate_receipts(item)):
+            keep(receipt_ids, value)
+
+    if not inventory:
+        transaction_ids.sort()
+        receipt_ids.sort()
+    tx_forward, tx_reverse = _alias_series("T", transaction_ids)
+    receipt_forward, receipt_reverse = _alias_series("R", receipt_ids)
+    return {
+        "tx_forward": tx_forward,
+        "tx_reverse": tx_reverse,
+        "receipt_forward": receipt_forward,
+        "receipt_reverse": receipt_reverse,
+    }
+
+
+def _alias_transaction_id(value: Any, aliases: dict[str, dict[str, str]]) -> str:
+    raw = str(value or "")
+    return aliases["tx_forward"].get(raw, raw)
+
+
+def _alias_receipt_id(value: Any, aliases: dict[str, dict[str, str]]) -> str:
+    raw = str(value or "")
+    return aliases["receipt_forward"].get(raw, raw)
+
+
+def _real_transaction_id(value: Any, aliases: dict[str, dict[str, str]]) -> str:
+    raw = str(value or "")
+    return aliases["tx_reverse"].get(raw, raw)
+
+
+def _real_receipt_id(value: Any, aliases: dict[str, dict[str, str]]) -> str:
+    raw = str(value or "")
+    return aliases["receipt_reverse"].get(raw, raw)
+
+
+def _alias_transactions(items: list[dict[str, Any]], aliases: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        mapped = deepcopy(item)
+        mapped["id"] = _alias_transaction_id(mapped.get("id"), aliases)
+        result.append(mapped)
+    return result
+
+
+def _alias_receipts(items: list[dict[str, Any]], aliases: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        mapped = deepcopy(item)
+        mapped["id"] = _alias_receipt_id(mapped.get("id"), aliases)
+        result.append(mapped)
+    return result
+
+
+def _alias_candidates(items: list[dict[str, Any]], aliases: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        mapped = deepcopy(item)
+        mapped["transaction_id"] = _alias_transaction_id(mapped.get("transaction_id"), aliases)
+        if mapped.get("receipt_upload_id") is not None:
+            mapped["receipt_upload_id"] = _alias_receipt_id(mapped.get("receipt_upload_id"), aliases)
+        if isinstance(mapped.get("receipt_upload_ids"), list):
+            mapped["receipt_upload_ids"] = [_alias_receipt_id(value, aliases) for value in mapped["receipt_upload_ids"]]
+        result.append(mapped)
+    return result
+
+
+def _alias_tasks(items: list[dict[str, Any]], aliases: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+    result = []
+    for task in items:
+        if not isinstance(task, dict):
+            continue
+        mapped = deepcopy(task)
+        if isinstance(mapped.get("transaction_ids"), list):
+            mapped["transaction_ids"] = [_alias_transaction_id(value, aliases) for value in mapped["transaction_ids"]]
+        if isinstance(mapped.get("receipt_ids"), list):
+            mapped["receipt_ids"] = [_alias_receipt_id(value, aliases) for value in mapped["receipt_ids"]]
+        result.append(mapped)
+    return result
+
+
+def _worker_result_for_model(worker: dict[str, Any], aliases: dict[str, dict[str, str]]) -> dict[str, Any]:
+    mapped = deepcopy(worker)
+    observations = []
+    for item in mapped.get("observations") or []:
+        if not isinstance(item, dict):
+            continue
+        observations.append({
+            **item,
+            "transaction_id": _alias_transaction_id(item.get("transaction_id"), aliases),
+            "receipt_upload_ids": [_alias_receipt_id(value, aliases) for value in (item.get("receipt_upload_ids") or [])],
+        })
+    mapped["observations"] = observations
+    return mapped
+
+
+def _worker_result_to_real(worker: dict[str, Any], aliases: dict[str, dict[str, str]]) -> dict[str, Any]:
+    mapped = deepcopy(worker)
+    observations = []
+    for item in mapped.get("observations") or []:
+        if not isinstance(item, dict):
+            continue
+        observations.append({
+            **item,
+            "transaction_id": _real_transaction_id(item.get("transaction_id"), aliases),
+            "receipt_upload_ids": [_real_receipt_id(value, aliases) for value in (item.get("receipt_upload_ids") or [])],
+        })
+    mapped["observations"] = observations
+    decisions = []
+    for item in mapped.get("decisions") or []:
+        if not isinstance(item, dict):
+            continue
+        decisions.append({
+            **item,
+            "transaction_id": _real_transaction_id(item.get("transaction_id"), aliases),
+            "receipt_upload_ids": [_real_receipt_id(value, aliases) for value in (item.get("receipt_upload_ids") or [])],
+        })
+    if decisions:
+        mapped["decisions"] = decisions
+    return mapped
+
+
+def _plan_to_real(plan: dict[str, Any], aliases: dict[str, dict[str, str]]) -> dict[str, Any]:
+    mapped = deepcopy(plan)
+    tasks = []
+    for task in mapped.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        resolved = deepcopy(task)
+        if isinstance(resolved.get("transaction_ids"), list):
+            resolved["transaction_ids"] = [_real_transaction_id(value, aliases) for value in resolved["transaction_ids"]]
+        if isinstance(resolved.get("receipt_ids"), list):
+            resolved["receipt_ids"] = [_real_receipt_id(value, aliases) for value in resolved["receipt_ids"]]
+        tasks.append(resolved)
+    mapped["tasks"] = tasks
+    return mapped
+
+
+def _final_to_real(final: dict[str, Any], aliases: dict[str, dict[str, str]]) -> dict[str, Any]:
+    mapped = deepcopy(final)
+    decisions = []
+    for decision in mapped.get("decisions") or []:
+        if not isinstance(decision, dict):
+            continue
+        resolved = deepcopy(decision)
+        resolved["transaction_id"] = _real_transaction_id(resolved.get("transaction_id"), aliases)
+        if isinstance(resolved.get("receipt_upload_ids"), list):
+            resolved["receipt_upload_ids"] = [_real_receipt_id(value, aliases) for value in resolved["receipt_upload_ids"]]
+        decisions.append(resolved)
+    mapped["decisions"] = decisions
+    return mapped
+
+
 class _AgentOutputLimit(AuditSkillError):
     """A truncated response must never be parsed or applied as a decision."""
 
@@ -321,6 +516,8 @@ _PLANNER_SYSTEM_PROMPT = f"""你是 Omni AI 实验室的审计指挥智能体“
 scope_catalog 是有预算的 ID 预览，scope_catalog_omitted 显示未预览数，不是全部候选。需要该策略完整范围时显式给 transaction_ids=[]、receipt_ids=[]，由服务端按策略确定全范围。
 当 strategy=amount_first_iterative_v1 时，按金额优先的残差轮次重规划：先精确金额一对一，再同金额消歧，最后合理差额和组合；不要复核已经锁定移除的关系。
 严格遵守 iteration.phase：exact_amount 只处理精确一对一及其消歧；single_receipt_adjustments 只处理单凭证有界调整；documented_groups 才可处理有业务证据的批次或报销。不得提前凑多单金额，不得重新引入已确认凭证。
+默认材料前提是每条待核流水有对应凭证；主动搜索完整范围，不把未列手续费、小费或附加收入当成缺失材料。收入单票差额层优先复核内核在同币种、同方向的完整时间序列中给出的金额附近一对一最优解，不以本分片排名代替整体方案。不同行业均适用；不得假定某家公司固定费率。
+流水使用 T001、T002…，小票使用 R001、R002…；超过999项编号可继续增长。仅可使用输入中出现的编号。
 用户通常提交本期可对应的凭证，这是检索先验，不是必须达到的匹配配额。PDF 子凭证的月份排除、重复和完整性约束不得放开。
 默认使用内置会计作业法 {SEED_PLAYBOOK_ID}，顺序为：公司卡支出、其他直接支出、收入结算、员工合并报销、异常复核。
 只有公司画像或本期证据明确表明不适用时才能改变顺序；每个偏离必须在 deviations 中写明原因和证据。
@@ -332,19 +529,24 @@ _WORKER_SYSTEM_PROMPT = """你是 Omni AI 实验室的证据工作智能体“�
 算术、候选关系和可用分组均由确定性内核提供；不得发明交易、凭证、员工、账户、日期或金额。
 金额优先策略中，唯一精确金额是主要证据；名称差异或轻微日期先后差异不应单独否定金额一致的关系，日期/名称主要用于同金额候选消歧。
 残差候选的内核金额差额、公司及时间支持可以支持费用/税收调整推断，无须票面明确写出抽成；必须披露差额及推断性质，不能声称费用类型已被证明。
+收入以时间顺序和金额接近联合核对，金额差异可正可负，费用、额外收入的具体构成不必逐项可得。复核 evidence.income_sequence 中的全局方案和约束，不重新按分片排序凑配；差额成因未分解写入 finding/evidence，只有真正影响关系的冲突（金额超界、币种/方向不符、日期不可能、重复占用、同等方案）才写入 unresolved。
 必须依据 date_role 和 date_evidence 理解日期：开票/创建日不等于实际付款，发票可能在到期日前后付款；即时小票则通常当天交易。收入 POS 日报是销售活动，支付处理商可能稍后净结算，不能因银行名称不是门店名称而直接否决。保留卡、现金、Swish 分项，不把全渠道总销售额冒充银行卡净结算；只能评估内核给出的候选和差额，不自行创造新金额或组合。
 只输出 observations 事实、差额、证据及 unresolved，不输出 decisions、recommendation 或 confidence，不作匹配裁决。必须覆盖给定候选关系，group_id 组必须完整，不拼接不同组。
 按给定 scope 执行 operation；将 income/expense/refund/payroll 分开，按实际事件日期排序。支出精确金额先查，已确认项不得重新检索。员工报销不能无证据凑单，最后保留异常；工资差额只能 suspected，不能断言发票错误。
 cache_notes 只能记录可重建的检索摘要，不能把未经验证的猜测写成永久规则。
+所有流水/小票 ID 使用输入中的紧凑编号（T001…/R001…），不要输出原始长 ID。
 只返回符合 JSON Schema 的对象。"""
 
 _FINAL_SYSTEM_PROMPT = """你是审计指挥智能体“李师傅”，现在评估马师傅的证据结果。
 你是唯一决策方，依据内核候选和马师傅 observations 作 decisions，不要求马师傅重复决策或给置信度。只有证据明确且 confidence >= 0.88 才能 match；不得新增候选或重新计算金额。
 金额优先策略中，不得仅因名称不同或轻微日期差异否定唯一金额一致关系；有公司/日期支持的有界金额调整可以确认并披露推断，不要求找到明确手续费字样。
 核对日期角色和原支付分项：发票开票日不应被要求与流水付款日相同，收入销售日不应被要求与处理商结算日相同；开票/到期与实际支付必须分开陈述，推断调整不得冒充已证明的手续费。
+默认每条待核流水都有对应凭证，应积极检索，不因收入费用或额外收入缺少逐项清单而保留建议。优先采用内核验证的全局时间顺序＋金额附近的一对一方案：同币种、同方向、结算时间窗内，先最大化有效对应数量，再比较整体相对差额及日期间隔；允许跳过额外项，不能仅按第几条或本分片顺序硬配。
+收入差额可以来自费用或额外收入，正负均可；确认凭证关系不等于证明具体费率或差额构成。缺少差额明细本身不是 unresolved，也不需要降低匹配置信度；只在存在真实关系冲突或同等最优方案时建议复核。不依赖某一行业、店铺或预设平台费率。
 证据不足、日期矛盾或存在冲突时必须保守处理。skill_candidates 只是待人工审核的公司技能草案，不会自动生效；不要提出跨公司共享具体人员、账户或交易方信息的技能。
 改进已有技能时必须沿用该技能的原始 title；只有规则语义确实不同才可使用新 title。
-最终所有 recommendations 必须在 kernel 候选中并有 observations 覆盖；group_id 对应的组必须完整，不混合不同组或重复凭证。员工报销无证据不能凑单；工资差额仅 suspected，不必定是发票错误。cache_notes 是假设，不是规则。只返回符合 JSON Schema 的对象。"""
+最终所有 recommendations 必须在 kernel 候选中并有 observations 覆盖；group_id 对应的组必须完整，不混合不同组或重复凭证。员工报销无证据不能凑单；工资差额仅 suspected，不必定是发票错误。cache_notes 是假设，不是规则。
+所有流水/小票 ID 使用输入中的紧凑编号（T001…/R001…），不要输出原始长 ID。只返回符合 JSON Schema 的对象。"""
 
 
 def _summary_context(context: dict[str, Any]) -> dict[str, Any]:
@@ -864,12 +1066,14 @@ def _analyze_agentic_audit(
     notebooks: AuditNotebooks,
 ) -> dict[str, Any]:
     document = _source_document(context)
+    aliases = _id_aliases(context)
     if len(document) > MAX_AGENTIC_SOURCE_CHARS:
         raise AuditSkillError("审计候选资料超过智能流程工作预算，请先进一步筛选")
     summary = _summary_context(context)
     chunks = _worker_chunks(context)
     catalog = [{
-        "transaction_id": item["transaction_id"], "receipt_ids": sorted(candidate_receipts(item)),
+        "transaction_id": _alias_transaction_id(item["transaction_id"], aliases),
+        "receipt_ids": sorted(_alias_receipt_id(value, aliases) for value in candidate_receipts(item)),
         "strategy": _strategy(item), "group_id": item.get("group_id"),
     } for chunk in chunks for item in chunk["deterministic_candidates"]]
     # Preview IDs without reducing candidate/chunk capacity. Empty scope IDs
@@ -883,6 +1087,11 @@ def _analyze_agentic_audit(
         preview.append(item)
     summary["scope_catalog"] = preview
     summary["scope_catalog_omitted"] = len(catalog) - len(preview)
+    summary["id_scheme"] = {
+        "transaction_pattern": "T001/T002/...",
+        "receipt_pattern": "R001/R002/...",
+        "scope": "model_prompt_only",
+    }
     summary_document = _serialized(summary)
     if len(summary_document) > MAX_AUDIT_CONTEXT_CHARS:
         raise AuditSkillError("李师傅计划摘要超过本地模型安全预算")
@@ -965,7 +1174,7 @@ def _analyze_agentic_audit(
         # Admission belongs to the common transport, not an entire audit round.
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit-evidence") as executor:
             _publish_progress(run_id, stage="initial_plan", agent_kind="audit_planner")
-            plan_response, plan = _request_agent(
+            plan_response, plan_raw = _request_agent(
                 client,
                 system_prompt=_PLANNER_SYSTEM_PROMPT,
                 user_prompt=planner_user_prompt,
@@ -974,6 +1183,7 @@ def _analyze_agentic_audit(
                 max_tokens=3072,
                 stage="李师傅制定计划", step_kind="initial_plan", run_id=run_id, steps=steps,
             )
+            plan = _plan_to_real(plan_raw, aliases)
             chunks = _scoped_jobs(plan, context, notebooks)
             notebooks.put("audit_planner", "plan:" + str((context.get("iteration") or {}).get("number", 1)), "plan", plan)
             current_task_ids = {task["task_id"] for task in plan["tasks"]}
@@ -1051,10 +1261,24 @@ def _analyze_agentic_audit(
                     prepared_key = None
                     check_active()
                     worker_document = _serialized({
-                        **{key: value for key, value in chunk.items() if key != "detail_excerpts"},
-                        "transactions": prepared["transaction_facts"], "receipts": prepared["receipt_facts"],
-                        "prepared_evidence": {key: value for key, value in prepared.items()
-                                              if key not in ("receipt_facts", "transaction_facts", "tasks")},
+                        **{key: value for key, value in {
+                            **chunk,
+                            "tasks": _alias_tasks(chunk["tasks"], aliases),
+                            "transactions": _alias_transactions(chunk["transactions"], aliases),
+                            "receipts": _alias_receipts(chunk["receipts"], aliases),
+                            "deterministic_candidates": _alias_candidates(chunk["deterministic_candidates"], aliases),
+                        }.items() if key != "detail_excerpts"},
+                        "transactions": _alias_transactions(prepared["transaction_facts"], aliases),
+                        "receipts": _alias_receipts(prepared["receipt_facts"], aliases),
+                        "prepared_evidence": {
+                            **{key: value for key, value in prepared.items()
+                               if key not in ("receipt_facts", "transaction_facts", "tasks", "amount_searches")},
+                            "amount_searches": [{
+                                **item,
+                                "receipt_ids": [_alias_receipt_id(value, aliases) for value in (item.get("receipt_ids") or [])],
+                                "duplicate_candidates": [_alias_receipt_id(value, aliases) for value in (item.get("duplicate_candidates") or [])],
+                            } for item in (prepared.get("amount_searches") or []) if isinstance(item, dict)],
+                        },
                     })
                     worker_user_prompt = (
                         f"审计编号：{audit_id}\n任务分片：{batch_index}/{len(chunks)}"
@@ -1074,7 +1298,7 @@ def _analyze_agentic_audit(
                         if not recover_chunk(chunk, batch_index, exc):
                             batch_index += 1
                         continue
-                    worker = _worker_evidence(worker_raw, chunk)
+                    worker = _worker_evidence(_worker_result_to_real(worker_raw, aliases), chunk)
                     reused_workers[chunk_key(chunk)] = worker
                     _record_step(steps, run_id, {
                         "agent_kind": "evidence_worker", "step_kind": "evidence_review", "status": "completed",
@@ -1101,10 +1325,10 @@ def _analyze_agentic_audit(
 
                 final_input = {
                     "summary": {key: value for key, value in summary.items() if key != "scope_catalog"},
-                    "tasks": chunk["tasks"],
-                    "kernel_candidates": chunk["deterministic_candidates"],
+                    "tasks": _alias_tasks(chunk["tasks"], aliases),
+                    "kernel_candidates": _alias_candidates(chunk["deterministic_candidates"], aliases),
                     "batch": {"index": batch_index, "count": len(chunks)},
-                    "worker_result": worker,
+                    "worker_result": _worker_result_for_model(worker, aliases),
                 }
                 final_user_prompt = (
                     f"审计编号：{audit_id}\n请评估本分片：\n"
@@ -1117,7 +1341,7 @@ def _analyze_agentic_audit(
                 for task in chunk["tasks"]:
                     notebooks.task("audit_planner", approval_task(task), "running")
                 try:
-                    final_response, final = _request_agent(
+                    final_response, final_raw = _request_agent(
                         client,
                         system_prompt=_FINAL_SYSTEM_PROMPT,
                         user_prompt=final_user_prompt,
@@ -1132,6 +1356,7 @@ def _analyze_agentic_audit(
                     if not recover_chunk(chunk, batch_index, exc):
                         batch_index += 1
                     continue
+                final = _final_to_real(final_raw, aliases)
                 final["decisions"] = _approved_decisions(final, worker, chunk, used_receipts, used_transactions)
                 for decision in final["decisions"]:
                     if decision["recommendation"] == "match":
