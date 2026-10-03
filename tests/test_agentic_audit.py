@@ -155,8 +155,11 @@ def test_agentic_audit_fails_closed_on_invalid_agent_response() -> None:
 
 
 def test_agentic_audit_splits_large_evidence_by_transaction() -> None:
+    from omni_ai_controller.agentic_audit import MAX_WORKER_CHUNK_TOKENS
+
     client = FakeClient([_plan(), _worker(), _final(), _worker(), _final()])
-    long_text = "凭证内容" * 1800
+    # Each receipt fits independently; both exceed the configured chunk budget.
+    long_text = "凭证内容" * (MAX_WORKER_CHUNK_TOKENS // 8)
     context = {
         "profile": {},
         "transactions": [{"id": "tx-1"}, {"id": "tx-2"}],

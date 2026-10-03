@@ -5,6 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
 from copy import deepcopy
 import json
+import os
 from threading import Lock
 from datetime import datetime, timezone
 from time import time
@@ -34,11 +35,21 @@ SEED_STRATEGY_ORDER = [
     "anomaly_review",
 ]
 MAX_AGENTIC_SOURCE_CHARS = 4_000_000
-MAX_PLANNER_INPUT_TOKENS = 16_000
-MAX_WORKER_CHUNK_TOKENS = 12_000
+
+
+def _audit_input_budgets(context_window: str | None) -> tuple[int, int, int]:
+    # Explicit opt-in only after the model has been verified at 65536 tokens.
+    # 48000 input + 8192 retry output leaves 9344 for schemas/template overhead.
+    if str(context_window or "").strip() == "65536":
+        return 48_000, 40_000, 48_000
+    return 16_000, 12_000, 18_000
+
+
+MAX_PLANNER_INPUT_TOKENS, MAX_WORKER_CHUNK_TOKENS, MAX_AGENT_INPUT_TOKENS = _audit_input_budgets(
+    os.environ.get("OMNI_AUDIT_MODEL_CONTEXT_TOKENS")
+)
 MAX_WORKER_CHUNK_CANDIDATES = 4
 MAX_WORKER_CHUNK_TRANSACTIONS = 2
-MAX_AGENT_INPUT_TOKENS = 18_000
 MAX_AGENTIC_CHUNKS = 128
 MAX_AGENT_RETRY_OUTPUT_TOKENS = 8192
 MAX_AGENT_STEP_SECONDS = 240
@@ -1093,7 +1104,7 @@ def _analyze_agentic_audit(
         "scope": "model_prompt_only",
     }
     summary_document = _serialized(summary)
-    if len(summary_document) > MAX_AUDIT_CONTEXT_CHARS:
+    if len(summary_document) > max(MAX_AUDIT_CONTEXT_CHARS, MAX_PLANNER_INPUT_TOKENS * 2):
         raise AuditSkillError("李师傅计划摘要超过本地模型安全预算")
     planner_user_prompt = (
         f"审计编号：{audit_id}\n请制定初始计划：\n"
