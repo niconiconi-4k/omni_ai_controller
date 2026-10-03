@@ -13,7 +13,6 @@ from typing import Any
 
 from .audit_skill import (
     AUDIT_DECISIONS_SCHEMA,
-    MAX_AUDIT_CONTEXT_CHARS,
     AuditSkillError,
 )
 from .client import ModelServerClient, ServerRequestCancelled, ServerRequestError, ServerRequestTimeout
@@ -54,6 +53,11 @@ MAX_AGENTIC_CHUNKS = 128
 MAX_AGENT_RETRY_OUTPUT_TOKENS = 8192
 MAX_AGENT_STEP_SECONDS = 240
 MAX_AGENTIC_SECONDS = 2400
+# Prompt-only projections; canonical history, skills and notebooks are untouched.
+# Fixed UTF-8 budgets also apply in 64k mode, leaving capacity for current facts.
+MAX_LEARNING_PROMPT_BYTES = 2_048
+MAX_SKILL_PROMPT_BYTES = 6_000
+MAX_SKILL_ITEM_BYTES = 2_000
 
 
 def _alias_series(prefix: str, values: list[str]) -> tuple[dict[str, str], dict[str, str]]:
@@ -560,6 +564,124 @@ _FINAL_SYSTEM_PROMPT = """你是审计指挥智能体“李师傅”，现在评
 所有流水/小票 ID 使用输入中的紧凑编号（T001…/R001…），不要输出原始长 ID。只返回符合 JSON Schema 的对象。"""
 
 
+def _planner_inventory_summary(context: dict[str, Any]) -> dict[str, Any]:
+    """Project transport metadata, never forward an upstream seed/notebook.
+
+    Main's seed may contain per-source task catalogs and source projections.
+    Their external-cache capacity is NOT the planner's model-input capacity.
+    Canonical sources stay intact for organize/worker/detail retrieval.
+    """
+    inventory = context.get("source_inventory")
+    supplied = context.get("source_inventory_summary")
+    supplied = supplied if isinstance(supplied, dict) else {}
+    supplied_counts = supplied.get("counts")
+    supplied_counts = supplied_counts if isinstance(supplied_counts, dict) else {}
+    counts = {key: value for key in ("transactions", "receipts", "documents")
+              if type(value := supplied_counts.get(key)) is int and 0 <= value <= 1_000_000_000}
+    category_counts = {}
+    if isinstance(inventory, dict):
+        for kind in ("transactions", "receipts"):
+            items = [item for item in inventory.get(kind) or [] if isinstance(item, dict)]
+            counts[kind] = len(items)
+            category_counts[kind] = dict(Counter(category(item) for item in items))
+    else:
+        for kind in ("transactions", "receipts"):
+            counts.setdefault(kind, len(context.get(kind) or []))
+    return {"counts": counts, "category_counts": category_counts,
+            "purpose": "deterministic_cache_only", "include_in_model_prompt": False,
+            "ordering": "category/currency/actual_event_date; unknown_last; ties_retained",
+            "access": "organize covers all canonical sources; workers retrieve complete kernel scopes"}
+
+
+def _prompt_text(value: Any, maximum: int) -> str:
+    # Never stringify nested reports or instructions disguised as metadata.
+    text = value.encode("utf-8")[:maximum].decode("utf-8", errors="ignore") if isinstance(value, str) else ""
+    while len(_serialized(text).encode("utf-8")) > maximum:
+        text = text[:-1]  # Include JSON escaping (e.g. controls/quotes) in the budget.
+    return text
+
+
+def _prompt_skills(context: dict[str, Any], owner: str) -> list[dict[str, Any]]:
+    """Only reusable, approved rule fields for this role, not learned run output.
+
+    Main selects built_in/active skills. Explicit draft/rejected status is also
+    rejected here; absent status is the existing Main transport contract.
+    """
+    projected: list[dict[str, Any]] = []
+    skills = context.get("active_skills")
+    for item in skills if isinstance(skills, list) else []:
+        if not isinstance(item, dict) or item.get("owner_agent") != owner:
+            continue
+        if item.get("status", "active") not in ("active", "built_in"):
+            continue
+        content = item.get("content")
+        content = content if isinstance(content, dict) else {}
+        rule: dict[str, Any] = {}
+        for field in ("trigger_conditions", "guidance", "principles"):
+            values = content.get(field)
+            if isinstance(values, list):
+                rule[field] = [_prompt_text(value, 240) for value in values[:4] if isinstance(value, str)]
+        if isinstance(content.get("strategy_order"), list):
+            rule["strategy_order"] = [value for value in content["strategy_order"][:5]
+                                      if isinstance(value, str) and value in SEED_STRATEGY_ORDER]
+        if isinstance(content.get("deviation_policy"), str):
+            rule["deviation_policy"] = _prompt_text(content["deviation_policy"], 240)
+        skill = {"skill_key": _prompt_text(item.get("skill_key"), 128), "owner_agent": owner,
+                 "title": _prompt_text(item.get("title"), 384),
+                 "description": _prompt_text(item.get("description"), 512), "content": rule}
+        if type(item.get("version")) is int and 0 <= item["version"] <= 1_000_000_000:
+            skill["version"] = item["version"]
+        # Drop whole trailing guidance entries, never truncate serialized JSON.
+        while len(_serialized(skill).encode("utf-8")) > MAX_SKILL_ITEM_BYTES:
+            field = next((key for key in ("principles", "guidance", "trigger_conditions") if rule.get(key)), None)
+            if field is None:
+                break
+            rule[field].pop()
+        if len(_serialized([*projected, skill]).encode("utf-8")) > MAX_SKILL_PROMPT_BYTES:
+            break
+        projected.append(skill)
+        if len(projected) >= 30:
+            break
+    return projected
+
+
+def _learning_prompt_context(context: dict[str, Any], skills: list[dict[str, Any]]) -> dict[str, Any]:
+    """Main history shape: recent_workflow_events + previous_reconciliation.report.
+
+    Previous reports/catalogs/steps/decisions are historical, never current
+    evidence or approval authority. Only bounded counts/risk flags/approved
+    skill IDs enter prompts. Current candidate evidence stays in the kernel.
+    """
+    history = context.get("learning_context")
+    history = history if isinstance(history, dict) else {}
+    previous = history.get("previous_reconciliation")
+    previous = previous if isinstance(previous, dict) else {}
+    report = previous.get("report")
+    report = report if isinstance(report, dict) else {}
+    events = history.get("recent_workflow_events")
+    risks = report.get("risks")
+    projection = {
+        "history_scope": "historical_counts_and_approved_skill_ids_only; not_current_evidence_or_decisions",
+        "recent_workflow_event_count": len(events) if isinstance(events, list) else 0,
+        "previous_run_present": bool(previous),
+        "previous_run_had_error": bool(previous.get("error_code")),
+        "previous_risk_count": len(risks) if isinstance(risks, list) else 0,
+        "previous_relation_counts": {key: value for key in
+            ("matched_relations", "suggested_relations", "preserved_confirmed_relations", "new_matched_relations")
+            if type(value := report.get(key)) is int and 0 <= value <= 1_000_000_000},
+        "approved_skill_ids": [],
+        "approved_skill_ids_omitted": len(skills),
+        "evidence_access": "current kernel candidates and scoped worker retrieval; full history stored externally",
+    }
+    for skill in skills:
+        proposed = {**projection, "approved_skill_ids": [*projection["approved_skill_ids"], skill["skill_key"]],
+                    "approved_skill_ids_omitted": projection["approved_skill_ids_omitted"] - 1}
+        if len(_serialized(proposed).encode("utf-8")) > MAX_LEARNING_PROMPT_BYTES:
+            break
+        projection = proposed
+    return projection
+
+
 def _summary_context(context: dict[str, Any]) -> dict[str, Any]:
     candidates = context.get("deterministic_candidates") or []
     role_counts = Counter(
@@ -567,6 +689,7 @@ def _summary_context(context: dict[str, Any]) -> dict[str, Any]:
         for item in candidates
         if isinstance(item, dict)
     )
+    skills = _prompt_skills(context, "audit_planner")
     return {
         "seed_playbook": {
             "id": SEED_PLAYBOOK_ID,
@@ -574,19 +697,8 @@ def _summary_context(context: dict[str, Any]) -> dict[str, Any]:
             "objectives": SEED_OBJECTIVES,
         },
         "profile": context.get("profile") or {},
-        "active_skills": [
-            {
-                "skill_key": str(item.get("skill_key") or "")[:128],
-                "owner_agent": str(item.get("owner_agent") or "")[:32],
-                "title": str(item.get("title") or "")[:255],
-                "description": str(item.get("description") or "")[:500],
-                "content": item.get("content") if isinstance(item.get("content"), dict) else {},
-            }
-            for item in (context.get("active_skills") or [])[:30]
-            if isinstance(item, dict)
-        ],
-        "learning_context": context.get("learning_context")
-        if isinstance(context.get("learning_context"), dict) else {},
+        "active_skills": skills,
+        "learning_context": _learning_prompt_context(context, skills),
         "counts": {
             "transactions": len(context.get("transactions") or []),
             "receipts": len(context.get("receipts") or []),
@@ -594,11 +706,7 @@ def _summary_context(context: dict[str, Any]) -> dict[str, Any]:
             "candidate_roles": dict(role_counts),
         },
         "strategy": context.get("strategy"),
-        "source_inventory_summary": context.get("source_inventory_summary") or {
-            "counts": {kind: len((context.get("source_inventory") or {}).get(kind) or [])
-                       for kind in ("transactions", "receipts")},
-            "purpose": "deterministic_cache_only", "include_in_model_prompt": False,
-        },
+        "source_inventory_summary": _planner_inventory_summary(context),
         "iteration": context.get("iteration") or {},
     }
 
@@ -609,9 +717,11 @@ def _serialized(value: Any) -> str:
 
 def _source_document(context: dict[str, Any]) -> str:
     # Candidate capacity is unchanged. Cache transport is neither candidate
-    # context nor a prompt, including partial/error-result accounting.
+    # context nor a prompt, including partial/error-result accounting. Upstream
+    # Inventory summaries/history may duplicate notebooks/catalogs/reports;
+    # excluding those derivatives does not reduce transaction/candidate capacity.
     return _serialized({key: value for key, value in context.items()
-                        if key not in ("_agent_state", "source_inventory")})
+                        if key not in ("_agent_state", "source_inventory", "source_inventory_summary", "learning_context")})
 
 
 def _estimated_tokens(text: str) -> int:
@@ -670,7 +780,7 @@ def _worker_chunks(context: dict[str, Any]) -> list[dict[str, Any]]:
         "strategy": context.get("strategy"),
         "iteration": context.get("iteration") or {},
         "profile": context.get("profile") or {},
-        "active_skills": _summary_context(context)["active_skills"],
+        "active_skills": _prompt_skills(context, "evidence_worker"),
     }
 
     def build(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1069,6 +1179,59 @@ def _scoped_jobs(plan: dict[str, Any], context: dict[str, Any], notebooks: Audit
     return jobs
 
 
+def _planner_payload(
+    audit_id: str, context: dict[str, Any], chunks: list[dict[str, Any]],
+    aliases: dict[str, dict[str, str]],
+) -> tuple[dict[str, Any], str]:
+    """Budget the complete UTF-8 prompt; omitted previews never omit work."""
+    summary = _summary_context(context)
+    catalog = [{
+        "transaction_id": _alias_transaction_id(item["transaction_id"], aliases),
+        "receipt_ids": sorted(_alias_receipt_id(value, aliases) for value in candidate_receipts(item)),
+        "strategy": _strategy(item), "group_id": item.get("group_id"),
+    } for chunk in chunks for item in chunk["deterministic_candidates"]]
+    summary["scope_counts"] = {}
+    for strategy in SEED_STRATEGY_ORDER:
+        items = [item for item in catalog if item["strategy"] == strategy]
+        if items:
+            summary["scope_counts"][strategy] = {
+                "transactions": len({item["transaction_id"] for item in items}),
+                "receipts": len({value for item in items for value in item["receipt_ids"]}),
+                "candidate_relations": len(items),
+            }
+    summary["scope_catalog"] = []
+    summary["scope_catalog_omitted"] = len(catalog)
+    summary["scope_access"] = "transaction_ids=[] and receipt_ids=[] select the complete strategy, including omitted IDs"
+    summary["id_scheme"] = {
+        "transaction_pattern": "T001/T002/...",
+        "receipt_pattern": "R001/R002/...",
+        "scope": "model_prompt_only",
+    }
+
+    def prompt() -> str:
+        return (f"审计编号：{audit_id}\n请制定初始计划：\n"
+                f"<audit_summary>{_serialized(summary)}</audit_summary>")
+
+    # Reserve space for the retry instruction as well as the ID preview. Use
+    # the same conservative UTF-8 estimator as request admission, not len(str).
+    system_tokens = _estimated_tokens(_PLANNER_SYSTEM_PROMPT)
+    preview: list[dict[str, Any]] = []
+    for item in catalog:
+        proposed = [*preview, item]
+        if _estimated_tokens(_serialized(proposed)) > 6000:
+            break
+        summary["scope_catalog"] = proposed
+        summary["scope_catalog_omitted"] = len(catalog) - len(proposed)
+        if system_tokens + _estimated_tokens(prompt()) + 512 > MAX_PLANNER_INPUT_TOKENS:
+            summary["scope_catalog"] = preview
+            summary["scope_catalog_omitted"] = len(catalog) - len(preview)
+            break
+        preview = proposed
+    planner_user_prompt = prompt()
+    _ensure_input_budget(_PLANNER_SYSTEM_PROMPT, planner_user_prompt, MAX_PLANNER_INPUT_TOKENS)
+    return summary, planner_user_prompt
+
+
 def _analyze_agentic_audit(
     client: ModelServerClient,
     *,
@@ -1080,37 +1243,8 @@ def _analyze_agentic_audit(
     aliases = _id_aliases(context)
     if len(document) > MAX_AGENTIC_SOURCE_CHARS:
         raise AuditSkillError("审计候选资料超过智能流程工作预算，请先进一步筛选")
-    summary = _summary_context(context)
     chunks = _worker_chunks(context)
-    catalog = [{
-        "transaction_id": _alias_transaction_id(item["transaction_id"], aliases),
-        "receipt_ids": sorted(_alias_receipt_id(value, aliases) for value in candidate_receipts(item)),
-        "strategy": _strategy(item), "group_id": item.get("group_id"),
-    } for chunk in chunks for item in chunk["deterministic_candidates"]]
-    # Preview IDs without reducing candidate/chunk capacity. Empty scope IDs
-    # mean the complete server strategy scope, not just this bounded preview.
-    catalog_budget = min(6000, max(0, MAX_PLANNER_INPUT_TOKENS
-                         - _estimated_tokens(_serialized(summary)) - _estimated_tokens(_PLANNER_SYSTEM_PROMPT) - 512))
-    preview: list[dict[str, Any]] = []
-    for item in catalog:
-        if _estimated_tokens(_serialized([*preview, item])) > catalog_budget:
-            break
-        preview.append(item)
-    summary["scope_catalog"] = preview
-    summary["scope_catalog_omitted"] = len(catalog) - len(preview)
-    summary["id_scheme"] = {
-        "transaction_pattern": "T001/T002/...",
-        "receipt_pattern": "R001/R002/...",
-        "scope": "model_prompt_only",
-    }
-    summary_document = _serialized(summary)
-    if len(summary_document) > max(MAX_AUDIT_CONTEXT_CHARS, MAX_PLANNER_INPUT_TOKENS * 2):
-        raise AuditSkillError("李师傅计划摘要超过本地模型安全预算")
-    planner_user_prompt = (
-        f"审计编号：{audit_id}\n请制定初始计划：\n"
-        f"<audit_summary>{summary_document}</audit_summary>"
-    )
-    _ensure_input_budget(_PLANNER_SYSTEM_PROMPT, planner_user_prompt, MAX_PLANNER_INPUT_TOKENS)
+    summary, planner_user_prompt = _planner_payload(audit_id, context, chunks, aliases)
     if not chunks:
         raise AuditSkillError("马师傅没有收到可执行的确定性候选")
     steps: list[dict[str, Any]] = deepcopy(context.get("_prior_steps") or [])
