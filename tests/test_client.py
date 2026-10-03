@@ -1,6 +1,7 @@
 import json
 from io import BytesIO
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 import pytest
@@ -129,9 +130,15 @@ def test_streaming_json_requires_done_and_a_finish_reason():
 
 
 def test_parent_cancellation_closes_model_stream_without_applying_partial_json():
-    response = BytesIO(b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')
-    flags = iter([False, True])
+    cancelled = Event()
+
+    class CancellingResponse(BytesIO):
+        def readline(self, *args):
+            cancelled.set()
+            return super().readline(*args)
+
+    response = CancellingResponse(b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')
     with patch("omni_ai_controller.client.urlopen", return_value=response):
         with pytest.raises(ServerRequestCancelled):
-            ModelServerClient(config()).chat_json([], schema_name="test", schema={}, stream=True, cancelled=lambda: next(flags))
+            ModelServerClient(config()).chat_json([], schema_name="test", schema={}, stream=True, cancelled=cancelled.is_set)
     assert response.closed

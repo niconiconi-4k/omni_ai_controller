@@ -11,15 +11,17 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import parse_qs, urlencode
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.exception_handlers import http_exception_handler
 
 from .admin import AdminCommandError, AdminController
 from .agentic_audit import analyze_agentic_audit, cancel_audit_run, get_audit_progress
@@ -49,6 +51,9 @@ from .hardware import hardware_status
 from .mutsu_control import appearance, control_router, record_behavior, runtime_configuration, runtime_skills
 from .mutsu_control_store import MutsuControlStore
 from .metric_store import MetricCollector, MetricName, MetricRange, MetricStore, MetricStoreError
+from .model_queue import ModelQueues, QueueSettings, run_model_call
+from .model_queue_middleware import ModelQueueMiddleware
+from .request_errors import ModelQueueError
 from .vision import (
     MAX_VISION_DOCUMENT_BYTES,
     MAX_VISION_IMAGE_BYTES,
@@ -56,6 +61,7 @@ from .vision import (
     VisionRequestError,
     VisionSettingsError,
     VisionSettingsStore,
+    normalize_user_supplement,
 )
 from .voucher_classifier import VoucherClassificationError, classify_voucher
 
@@ -112,6 +118,8 @@ class ServiceSettings:
     metric_collection_enabled: bool = True
     vision_config_path: Path = Path("/etc/omni-ai-controller/openai-vision.json")
     vision_internal_token: str = ""
+    local_queue: QueueSettings = field(default_factory=QueueSettings)
+    external_queue: QueueSettings = field(default_factory=QueueSettings)
 
     @classmethod
     def from_environment(cls) -> "ServiceSettings":
@@ -160,6 +168,8 @@ class ServiceSettings:
                 )
             ),
             vision_internal_token=os.getenv("VISION_INTERNAL_TOKEN", ""),
+            local_queue=QueueSettings.from_environment("local"),
+            external_queue=QueueSettings.from_environment("external"),
         )
 
 
@@ -227,12 +237,28 @@ class VisionAnalyzeRequest(BaseModel):
     page_count: int | None = Field(default=None, ge=1, le=12)
     document_text: str | None = Field(default=None, max_length=100_000)
     model: Literal["gpt-4o", "gpt-4.1", "gpt-6-sol", "gpt-6.1-sol"] | None = None
-    source_kind: Literal["legacy", "image", "pdf_rendered"] = "legacy"
+    source_kind: Literal["legacy", "image", "pdf_rendered", "text"] = "legacy"
     document_hint: Literal["auto", "receipt", "invoice"] = "auto"
     classify: bool = True
     subject_company_name: str | None = Field(default=None, max_length=255)
     audit_period_start: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     audit_period_end: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    user_supplement: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_misnamed_supplement(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "supplement" in value:
+            raise ValueError("Use top-level user_supplement, not supplement; omit the source marker")
+        return value
+
+    @field_validator("user_supplement", mode="before")
+    @classmethod
+    def bounded_supplement(cls, value: Any) -> dict[str, Any] | None:
+        try:
+            return normalize_user_supplement(value)
+        except VisionRequestError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class StatementPageRequest(BaseModel):
@@ -247,6 +273,22 @@ class BankStatementAnalyzeRequest(BaseModel):
     source_kind: Literal["pdf_text", "pdf_image", "pdf_hybrid", "spreadsheet", "image"]
     pages: list[StatementPageRequest] = Field(default_factory=list, max_length=MAX_STATEMENT_PAGES)
     document_text: str = Field(default="", max_length=MAX_STATEMENT_TEXT_CHARS)
+    user_supplement: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_misnamed_supplement(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "supplement" in value:
+            raise ValueError("Use top-level user_supplement, not supplement; omit the source marker")
+        return value
+
+    @field_validator("user_supplement", mode="before")
+    @classmethod
+    def bounded_supplement(cls, value: Any) -> dict[str, Any] | None:
+        try:
+            return normalize_user_supplement(value)
+        except VisionRequestError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class VoucherClassificationRequest(BaseModel):
@@ -300,6 +342,7 @@ def create_app(
     mutsu_control_store: MutsuControlStore | None = None,
 ) -> FastAPI:
     active_settings = settings or ServiceSettings.from_environment()
+    active_queues = ModelQueues(active_settings.local_queue, active_settings.external_queue)
     active_controller = controller or AdminController(
         active_settings.model_dir,
         active_settings.allowed_containers,
@@ -345,6 +388,7 @@ def create_app(
         try:
             yield
         finally:
+            active_queues.close()
             if active_settings.metric_collection_enabled:
                 metric_collector.stop()
 
@@ -369,6 +413,7 @@ def create_app(
             "/internal/support/chat",
             "/internal/admin/authorize",
             "/internal/admin/confirm-password",
+            "/internal/model-queue/status",
         }:
             return await call_next(request)
         address = _client_ip(request)
@@ -378,6 +423,37 @@ def create_app(
                 content={"detail": "Client IP is not allowed"},
             )
         return await call_next(request)
+
+    application.state.model_queues = active_queues
+    application.add_middleware(ModelQueueMiddleware, queues=active_queues)
+
+    def queue_failure(exc: BaseException) -> ModelQueueError | None:
+        seen: set[int] = set()
+        while id(exc) not in seen:
+            seen.add(id(exc))
+            if isinstance(exc, ModelQueueError):
+                return exc
+            cause = exc.__cause__
+            if cause is None:
+                return None
+            exc = cause
+        return None
+
+    def queue_error_response(exc: ModelQueueError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code,
+                            content={"detail": str(exc), "code": exc.code},
+                            headers={"Retry-After": getattr(exc, "retry_after", "1")} if exc.status_code in {429, 503} else None)
+
+    @application.exception_handler(ModelQueueError)
+    async def model_queue_error(_request: Request, exc: ModelQueueError) -> JSONResponse:
+        return queue_error_response(exc)
+
+    @application.exception_handler(StarletteHTTPException)
+    async def bounded_model_http_error(request: Request, exc: StarletteHTTPException) -> Response:
+        failure = queue_failure(exc)
+        if failure:
+            return queue_error_response(failure)
+        return await http_exception_handler(request, exc)
 
     def require_admin(request: Request) -> dict[str, object]:
         if not active_settings.admin_token:
@@ -429,7 +505,7 @@ def create_app(
     developer_admin = permission_required("quantization.manage")
     accounts_admin = permission_required("accounts.manage")
 
-    def require_vision_internal(
+    async def require_vision_internal(
         x_vision_token: Annotated[str | None, Header()] = None,
     ) -> None:
         expected = active_settings.vision_internal_token
@@ -445,6 +521,20 @@ def create_app(
             )
 
     vision_internal = Depends(require_vision_internal)
+
+    @application.get("/internal/model-queue/status", dependencies=[vision_internal])
+    async def internal_model_queue_status() -> dict[str, Any]:
+        return active_queues.status()
+
+    async def require_queue_admin(request: Request) -> dict[str, object]:
+        # Status must remain readable while synchronous inference workers wait.
+        return await asyncio.to_thread(require_admin, request)
+
+    @application.get("/api/model-queue")
+    async def admin_model_queue_status(account: dict[str, object] = Depends(require_queue_admin)) -> dict[str, Any]:
+        if not account["is_super"] and not {"dashboard.read", "quantization.manage"}.intersection(account["permissions"]):
+            raise HTTPException(status_code=403, detail="Administrator permission required")
+        return active_queues.status()
 
     @application.get("/health/live")
     def health() -> dict[str, str]:
@@ -718,13 +808,18 @@ def create_app(
             raise HTTPException(status_code=422, detail="Visual PDF requires rendered pages without a text layer")
         legacy_supplied = any(
             value is not None
-            for value in (payload.filename, payload.content_type, payload.image_base64)
+            for value in (payload.content_type, payload.image_base64)
+        ) or (
+            payload.filename is not None and payload.source_kind != "text"
         )
         text_only_supplied = (
             not payload.pages
             and not legacy_supplied
-            and payload.page_count is not None
-            and bool((payload.document_text or "").strip())
+            and (payload.page_count is not None or payload.source_kind == "text")
+            and bool((payload.document_text or "").strip() or (
+                payload.source_kind == "text" and payload.user_supplement
+                and payload.user_supplement.get("manual_receipt", "").strip()
+            ))
         )
         if sum((bool(payload.pages), legacy_supplied, text_only_supplied)) != 1:
             raise HTTPException(
@@ -762,13 +857,13 @@ def create_app(
                 )
             decoded_pages.sort(key=lambda item: item[3])
             page_numbers = [page[3] for page in decoded_pages]
-            if payload.page_count is None:
+            if payload.page_count is None and payload.source_kind != "pdf_rendered":
                 if page_numbers != list(range(1, len(decoded_pages) + 1)):
                     raise HTTPException(
                         status_code=422,
                         detail="Sparse PDF pages require the document page_count",
                     )
-            elif max(page_numbers) > payload.page_count:
+            elif payload.page_count is not None and max(page_numbers) > payload.page_count:
                 raise HTTPException(
                     status_code=422,
                     detail="Vision page number exceeds the document page_count",
@@ -803,6 +898,8 @@ def create_app(
                     audit_period_start=payload.audit_period_start,
                     audit_period_end=payload.audit_period_end,
                     **({"source_kind": payload.source_kind} if payload.source_kind != "legacy" else {}),
+                    **({"document_hint": payload.document_hint} if payload.document_hint != "auto" else {}),
+                    **({"user_supplement": payload.user_supplement} if payload.user_supplement is not None else {}),
                 )
             image, filename, content_type, _ = decoded_pages[0]
             return active_vision_client.recognize(
@@ -815,6 +912,7 @@ def create_app(
                 audit_period_start=payload.audit_period_start,
                 audit_period_end=payload.audit_period_end,
                 **({"document_hint": payload.document_hint} if payload.document_hint != "auto" else {}),
+                **({"user_supplement": payload.user_supplement} if payload.user_supplement is not None else {}),
             )
         except VisionRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -849,7 +947,7 @@ def create_app(
                 (image, Path(page.filename).name, page.content_type, page.page_number)
             )
         decoded_pages.sort(key=lambda item: item[3])
-        if decoded_pages and [page[3] for page in decoded_pages] != list(
+        if not payload.source_kind.startswith("pdf_") and decoded_pages and [page[3] for page in decoded_pages] != list(
             range(1, len(decoded_pages) + 1)
         ):
             raise HTTPException(status_code=422, detail="Statement pages must be continuous from 1")
@@ -861,6 +959,7 @@ def create_app(
                 document_text=payload.document_text,
                 source_kind=payload.source_kind,
                 filename=Path(payload.filename).name,
+                **({"user_supplement": payload.user_supplement} if payload.user_supplement else {}),
             )
         except VisionRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -923,9 +1022,9 @@ def create_app(
     async def reconcile_audit_with_li_and_ma(
         payload: AuditReconciliationRequest, request: Request,
     ) -> Any:
-        active_controller.model_server.refresh()
+        await asyncio.to_thread(active_controller.model_server.refresh)
         run_id = str(payload.context.get("_run_id") or payload.audit_id)
-        task = asyncio.create_task(asyncio.to_thread(
+        task = asyncio.create_task(run_model_call(
             analyze_agentic_audit, active_controller.model_server.client,
             audit_id=payload.audit_id, context=payload.context,
         ))
@@ -934,12 +1033,25 @@ def create_app(
                 done, _ = await asyncio.wait({task}, timeout=1)
                 if not done and await request.is_disconnected():
                     cancel_audit_run(run_id)
-            return await task
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
             cancel_audit_run(run_id)
+            task.cancel()
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task.exception()
             raise
         except AuditSkillError as exc:
             snapshot = get_audit_progress(run_id)
+            failure = queue_failure(exc)
+            if failure:
+                return queue_error_response(failure)
             return JSONResponse(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 content={"detail": str(exc), "agent_state": snapshot.get("agent_state"),

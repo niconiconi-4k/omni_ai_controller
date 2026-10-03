@@ -5,21 +5,12 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .config import ServerConfig
-
-
-class ServerRequestError(RuntimeError):
-    """Raised when the model server cannot satisfy a request."""
-
-
-class ServerRequestTimeout(ServerRequestError):
-    """A bounded model computation exceeded its time budget."""
-
-
-class ServerRequestCancelled(ServerRequestError):
-    """The parent audit stopped; never keep consuming GPU for it."""
+from .model_transport import model_response, urlopen
+from .model_queue import run_model_call
+from .request_errors import ServerRequestError, ServerRequestTimeout, ServerRequestCancelled
 
 
 @dataclass(frozen=True)
@@ -32,6 +23,12 @@ class ChatResult:
 class ModelServerClient:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
+
+    async def async_chat(self, messages: list[dict[str, str]], **kwargs: Any) -> ChatResult:
+        return await run_model_call(self.chat, messages, **kwargs)
+
+    async def async_chat_json(self, messages: list[dict[str, str]], **kwargs: Any) -> ChatResult:
+        return await run_model_call(self.chat_json, messages, **kwargs)
 
     def live(self) -> bool:
         try:
@@ -138,7 +135,7 @@ class ModelServerClient:
             headers={"Authorization": f"Bearer {self.config.api_key}"},
             payload=payload,
             timeout=timeout,
-            **({"cancelled": cancelled} if stream else {}),
+            cancelled=cancelled,
         )
         try:
             message = data["choices"][0]["message"]
@@ -171,7 +168,7 @@ class ModelServerClient:
         finish_reason = None
         completed = False
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with model_response("local", request, timeout=timeout, opener=urlopen, cancelled=cancelled) as response:
                 while True:
                     if cancelled is not None and cancelled():
                         raise ServerRequestCancelled("上层审核已结束等待；关闭当前模型流，不再提交后续分片")
@@ -229,6 +226,7 @@ class ModelServerClient:
         headers: dict[str, str] | None = None,
         payload: dict[str, Any] | None = None,
         timeout: float,
+        cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         request_headers = {"Accept": "application/json", **(headers or {})}
         body = None
@@ -243,15 +241,22 @@ class ModelServerClient:
             method=method,
         )
         try:
-            with urlopen(request, timeout=timeout) as response:
+            # Health/control requests must not wait behind inference.
+            response_context = (
+                model_response("local", request, timeout=timeout, opener=urlopen, cancelled=cancelled)
+                if path == "/v1/chat/completions" else urlopen(request, timeout=timeout)
+            )
+            with response_context as response:
                 raw = response.read()
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise ServerRequestError(f"HTTP {exc.code}: {detail or exc.reason}") from exc
+            exc.close()
+            raise ServerRequestError(f"HTTP {exc.code}: 模型服务请求失败") from None
         except URLError as exc:
-            raise ServerRequestError(f"无法连接模型服务：{exc.reason}") from exc
+            if isinstance(exc.reason, TimeoutError):
+                raise ServerRequestTimeout("请求模型服务超时") from exc
+            raise ServerRequestError("无法连接模型服务") from None
         except TimeoutError as exc:
-            raise ServerRequestError("请求模型服务超时") from exc
+            raise ServerRequestTimeout("请求模型服务超时") from exc
 
         if not raw:
             return {}

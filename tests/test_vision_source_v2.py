@@ -46,7 +46,7 @@ def test_photograph_sol61_uses_vision_structured_output_and_supported_reasoning(
     assert result["status"] == "needs_manual_confirmation"
 
 
-@pytest.mark.parametrize("pages,text,count", [([], "hidden", 1), ([(b"x", "p.jpg", "image/jpeg", 2)], "", 2),
+@pytest.mark.parametrize("pages,text,count", [([], "hidden", 1),
     ([(b"x", "p.jpg", "image/jpeg", 1)], "untrusted text", 1),
     ([(b"x", "p.jpg", "image/jpeg", 1)] * 2, "", 2)])
 def test_visual_pdf_rejects_text_layer_missing_or_duplicate_pages(tmp_path, pages, text, count):

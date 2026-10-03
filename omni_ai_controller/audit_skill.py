@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
-import threading
+from contextlib import nullcontext
 from typing import Any
 
 from .client import ModelServerClient, ServerRequestError
 from .config import ConfigurationError
 
 
-AUDIT_SKILL_LOCK = threading.Lock()
+# Compatibility name only; model transport now owns bounded FIFO admission.
+AUDIT_SKILL_LOCK = nullcontext()
 MAX_AUDIT_CONTEXT_CHARS = 60_000
 
 AUDIT_DECISION_ITEM_SCHEMA: dict[str, Any] = {

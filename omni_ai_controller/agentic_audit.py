@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import copy_context
 from copy import deepcopy
 import json
 from threading import Lock
@@ -11,11 +12,11 @@ from typing import Any
 
 from .audit_skill import (
     AUDIT_DECISIONS_SCHEMA,
-    AUDIT_SKILL_LOCK,
     MAX_AUDIT_CONTEXT_CHARS,
     AuditSkillError,
 )
 from .client import ModelServerClient, ServerRequestCancelled, ServerRequestError, ServerRequestTimeout
+from .request_errors import ModelQueueTimeout
 from .config import ConfigurationError
 from .audit_notebooks import (
     AuditNotebooks, OPERATIONS, candidate_receipts, category, confirmed_ids,
@@ -586,6 +587,9 @@ def _request_agent(
             )
         except ServerRequestCancelled as exc:
             raise _AgentCancelled(str(exc)) from exc
+        except ModelQueueTimeout:
+            # Admission did not run inference; do not retry/split as a GPU step failure.
+            raise
         except ServerRequestTimeout as exc:
             _record_step(steps, run_id, {
                 "sequence_number": len(steps) + 1,
@@ -958,7 +962,8 @@ def _analyze_agentic_audit(
         return False
 
     try:
-        with AUDIT_SKILL_LOCK, ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit-evidence") as executor:
+        # Admission belongs to the common transport, not an entire audit round.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit-evidence") as executor:
             _publish_progress(run_id, stage="initial_plan", agent_kind="audit_planner")
             plan_response, plan = _request_agent(
                 client,
@@ -1040,7 +1045,7 @@ def _analyze_agentic_audit(
                             prepared_future.result()
                         check_active()
                         prepared_key = chunk_key(chunk)
-                        prepared_future = executor.submit(notebooks.prepare, chunk, chunk["tasks"], stopped)
+                        prepared_future = executor.submit(copy_context().run, notebooks.prepare, chunk, chunk["tasks"], stopped)
                     prepared = prepared_future.result()
                     prepared_future = None
                     prepared_key = None
@@ -1092,7 +1097,7 @@ def _analyze_agentic_audit(
                     if dependencies_ready(next_chunk):
                         check_active()
                         prepared_key = chunk_key(next_chunk)
-                        prepared_future = executor.submit(notebooks.prepare, next_chunk, next_chunk["tasks"], stopped)
+                        prepared_future = executor.submit(copy_context().run, notebooks.prepare, next_chunk, next_chunk["tasks"], stopped)
 
                 final_input = {
                     "summary": {key: value for key, value in summary.items() if key != "scope_catalog"},
