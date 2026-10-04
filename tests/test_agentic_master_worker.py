@@ -122,10 +122,11 @@ def test_scope_priority_dependency_and_legacy_defaults_are_actually_dispatched()
     result = analyze_agentic_audit(client, audit_id="scope", context=context)
     prompts = [json.loads(call["messages"][1]["content"].split("<audit_data>")[1].split("</audit_data>")[0])
                for call in client.calls if call["schema_name"] == "ma_shifu_evidence_review"]
-    assert [prompt["tasks"][0]["parent_task_id"] for prompt in prompts] == ["high", "low", "dependent"]
+    reverse = result["agent_state"]["identity_map"]["reverse"]
+    assert [reverse[prompt["tasks"][0]["parent_task_id"]] for prompt in prompts] == ["high", "low", "dependent"]
     assert [prompt["tasks"][0]["transaction_ids"] for prompt in prompts] == [["T002"], ["T001"], ["T001"]]
     assert prompts[1]["tasks"][0]["operation"] == "search_amount"
-    assert prompts[2]["tasks"][0]["depends_on"] == ["low"]
+    assert [reverse[value] for value in prompts[2]["tasks"][0]["depends_on"]] == ["low"]
     assert "李师傅计划" not in client.calls[1]["messages"][1]["content"]
     assert result["worker_batch_count"] == 3
     assert all(task["status"] == "completed" for task in result["agent_state"]["task_lists"]["audit_planner"])
@@ -245,7 +246,8 @@ def test_stop_preserves_completed_future_notebooks_and_only_li_approvals(monkeyp
     result = analyze_agentic_audit(client, audit_id="stopping", context=context)
     assert len(client.calls) == 3 and result["result"]["decisions"] == [decision]
     assert result["error_code"] == ("agentic_cancelled" if stop == "cancel" else "agentic_iteration_budget")
-    assert any(entry["key"] == "receipt:r2:basic" for entry in result["agent_state"]["notebooks"]["evidence_worker"]["entries"])
+    reverse = result["agent_state"]["identity_map"]["reverse"]
+    assert any(reverse[entry["key"]] == "receipt:r2:basic" for entry in result["agent_state"]["notebooks"]["evidence_worker"]["entries"])
     assert context["_agent_state"] == result["agent_state"]
     assert get_audit_progress("stopping")["agent_state"] == result["agent_state"]
 
@@ -301,7 +303,7 @@ def test_every_task_transition_is_published_as_real_agent_state(monkeypatch):
     states = [state["task_lists"]["evidence_worker"][0]["status"] for state in events if state["task_lists"]["evidence_worker"]]
     transitions = [value for index, value in enumerate(states) if index == 0 or states[index - 1] != value]
     assert transitions == ["pending", "preparing", "prepared", "running", "completed"]
-    assert all(state["version"] == 1 and state["audit_id"] == "events" for state in events)
+    assert all(state["version"] == 2 and state["identity_map"]["reverse"][state["audit_id"]] == "events" for state in events)
 
 
 def test_income_adjustment_does_not_require_explicit_fee_and_role_prompts_remain_conservative():

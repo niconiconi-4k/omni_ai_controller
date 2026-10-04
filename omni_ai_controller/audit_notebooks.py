@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 import json
 from threading import RLock
 from typing import Any, Callable
+from .audit_references import ShortReferenceCodec, REFERENCE_SCHEMA
 
 from .audit_inventory import (
     base_facts, category, event_date, fingerprint, fit_book, register_inventory, source_amount,
@@ -52,13 +53,30 @@ def candidate_receipts(candidate: dict[str, Any]) -> set[str]:
 
 class AuditNotebooks:
     def __init__(self, audit_id: str, run_id: str, previous: Any = None,
-                 publish: Callable[[dict[str, Any]], None] | None = None) -> None:
+                 publish: Callable[[dict[str, Any]], None] | None = None,
+                 *, source_inventory: dict[str, Any] | None = None) -> None:
         self.lock = RLock()
         self.publish = publish
-        valid = (isinstance(previous, dict) and previous.get("version") == 1
-                 and previous.get("audit_id") == audit_id and previous.get("run_id") == run_id)
+        old_codec = ShortReferenceCodec(previous.get("identity_map") if isinstance(previous, dict) else None)
+        same_audit = isinstance(previous, dict) and old_codec.decode(previous.get("audit_id"), text=False) == audit_id
+        self.codec = old_codec if same_audit else ShortReferenceCodec()
+        valid = (same_audit and previous.get("version") in (1, 2)
+                 and self.codec.decode(previous.get("run_id"), text=False) == run_id)
+        if source_inventory is not None:
+            self.codec.seed({"source_inventory": source_inventory})
+        if valid and previous.get("version") == 1:
+            # Seed legacy source entries before generic id traversal; retain all
+            # evidence and full original fingerprint for exact cache hits.
+            for book in (previous.get("notebooks") or {}).values():
+                for entry in book.get("entries") or []:
+                    content = entry.get("content")
+                    key = str(entry.get("key") or "")
+                    if isinstance(content, dict) and content.get("id") and key.startswith(("transaction:", "receipt:")):
+                        self.codec.reference(content["id"], "T" if key.startswith("transaction:") else "R", encoded=False)
         self.state: dict[str, Any] = {
-            "version": 1, "audit_id": audit_id, "run_id": run_id,
+            "version": 2, "reference_schema": REFERENCE_SCHEMA,
+            "audit_id": self.codec.reference(audit_id, "A", encoded=False), "run_id": self.codec.reference(run_id, "N", encoded=False),
+            "identity_map": self.codec.identity_map,
             "notebooks": {}, "task_lists": {},
             "stats": {"cache_hits": 0, "cache_misses": 0, "invalidations": 0,
                       "amount_searches": 0, "exact_amount_hits": 0, "duplicate_candidates": 0,
@@ -73,12 +91,12 @@ class AuditNotebooks:
             old = (previous.get("notebooks") or {}).get(owner, {}) if valid else {}
             self.state["notebooks"][owner] = {
                 "limit_bytes": MAX_NOTEBOOK_BYTES, "used_bytes": 0,
-                "entries": deepcopy(old.get("entries") or []),
+                "entries": self.codec.encode(self.codec.decode(old.get("entries") or []) if valid and previous.get("version") == 2 else old.get("entries") or [], storage=True),
                 "evicted_entries": int(old.get("evicted_entries") or 0),
                 "overflow": int(old.get("overflow") or 0),
             }
             tasks = (previous.get("task_lists") or {}).get(owner, []) if valid else []
-            self.state["task_lists"][owner] = deepcopy(tasks[-MAX_TASK_ENTRIES:])
+            self.state["task_lists"][owner] = self.codec.encode(self.codec.decode(tasks[-MAX_TASK_ENTRIES:]) if valid and previous.get("version") == 2 else tasks[-MAX_TASK_ENTRIES:], storage=True)
             self._fit(owner)
 
     def _measure(self, notebook: dict[str, Any]) -> int:
@@ -96,7 +114,7 @@ class AuditNotebooks:
     def organize_inventory(self, inventory: dict[str, Any], command: dict[str, Any] | None = None,
                            *, iteration: int = 1) -> None:
         with self.lock:
-            register_inventory(self.state, inventory, command, iteration=iteration)
+            register_inventory(self.state, inventory, command, iteration=iteration, codec=self.codec)
             self.emit()
 
     def snapshot(self) -> dict[str, Any]:
@@ -105,7 +123,13 @@ class AuditNotebooks:
 
     def task_statuses(self, owner: str) -> dict[str, str]:
         with self.lock:
-            return {task["task_id"]: task["status"] for task in self.state["task_lists"][owner]}
+            return {self.codec.decode(task["task_id"], text=False): task["status"] for task in self.state["task_lists"][owner]}
+
+    def internal_snapshot(self) -> dict[str, Any]:
+        """Internal scheduling only; never publish this projection."""
+        with self.lock:
+            return {"notebooks": self.codec.decode(self.state["notebooks"]),
+                    "task_lists": self.codec.decode(self.state["task_lists"])}
 
     def emit(self) -> None:
         with self.lock:
@@ -116,14 +140,15 @@ class AuditNotebooks:
             source_fingerprint: str = "") -> bool:
         with self.lock:
             notebook = self.state["notebooks"][owner]
-            entry = {"key": key, "kind": kind, "content": deepcopy(content),
-                     "source_fingerprint": source_fingerprint}
+            short_key = self.codec.reference(key, "Q" if key.startswith("search:") else "B", encoded=False)
+            entry = {"key": short_key, "kind": self.codec.text(kind), "content": self.codec.encode(content, storage=True),
+                     "source_fingerprint": self.codec.reference(source_fingerprint, "F", encoded=False) if source_fingerprint else ""}
             probe = {**notebook, "entries": [entry], "used_bytes": 0}
             if self._measure(probe) > MAX_NOTEBOOK_BYTES:
                 notebook["overflow"] += 1
                 self._fit(owner)
                 return False
-            notebook["entries"] = [item for item in notebook["entries"] if item.get("key") != key]
+            notebook["entries"] = [item for item in notebook["entries"] if item.get("key") != short_key]
             notebook["entries"].append(entry)
             self._fit(owner)
             return True
@@ -133,18 +158,20 @@ class AuditNotebooks:
         key = f"{source_kind}:{source.get('id')}:" + ("details" if details else "basic")
         source_hash = fingerprint(source)
         with self.lock:
+            self.codec.reference(source.get("id"), "T" if source_kind == "transaction" else "R", encoded=False)
+            short_key = self.codec.reference(key, "B", encoded=False)
             entries = self.state["notebooks"]["evidence_worker"]["entries"]
-            cached = next((entry for entry in entries if entry.get("key") == key), None)
-            if cached and cached.get("source_fingerprint") == source_hash:
+            cached = next((entry for entry in entries if entry.get("key") == short_key), None)
+            if cached and self.codec.decode(cached.get("source_fingerprint"), text=False) == source_hash:
                 self.state["stats"]["cache_hits"] += 1
-                return deepcopy(cached["content"])
+                return self.codec.decode(cached["content"])
             if cached:
                 self.state["stats"]["invalidations"] += 1
                 # Invalidate BOTH basic and detail projections on a source change.
                 prefix = f"{source_kind}:{source.get('id')}:"
-                entries[:] = [entry for entry in entries if not str(entry.get("key")).startswith(prefix)]
+                entries[:] = [entry for entry in entries if not str(self.codec.decode(entry.get("key"), text=False)).startswith(prefix)]
             self.state["stats"]["cache_misses"] += 1
-            content = base_facts(source)
+            content = base_facts(source, source_kind=source_kind)
             financial = source.get("financial_facts")
             if details:
                 for name in ("party", "parties", "accounts", "account", "reference", "references", "taxes",
@@ -160,6 +187,7 @@ class AuditNotebooks:
 
     def task(self, owner: str, task: dict[str, Any], status: str) -> None:
         with self.lock:
+            task = self.codec.encode(task, storage=True)
             tasks = self.state["task_lists"][owner]
             entry = next((item for item in tasks if item.get("task_id") == task["task_id"]), None)
             if entry is None:

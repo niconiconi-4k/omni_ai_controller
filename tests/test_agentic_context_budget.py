@@ -141,7 +141,8 @@ def test_synthetic_oversized_inventory_summary_projection_preserves_worker_sourc
         assert book["limit_bytes"] == MAX_NOTEBOOK_BYTES == 8 * 1024 * 1024
         assert book["used_bytes"] == len(serialized(book).encode("utf-8")) <= MAX_NOTEBOOK_BYTES
         ids = {entry["content"]["id"] for entry in book["entries"] if entry["kind"] == "source_basic"}
-        assert ids.issuperset(item["id"] for item in [*context["transactions"], *context["receipts"]])
+        forward = result["agent_state"]["identity_map"]["forward"]
+        assert ids.issuperset(forward[item["id"]] for item in [*context["transactions"], *context["receipts"]])
 
 
 @pytest.mark.parametrize("unicode_id", ["中文€", "😀𠮷"])
@@ -283,11 +284,12 @@ def test_main_shaped_147k_learning_history_is_not_current_role_evidence(monkeypa
     assert history["previous_relation_counts"]["matched_relations"] == 115
     assert history["previous_risk_count"] == 1
     assert history["recent_workflow_event_count"] == 1
-    assert history["approved_skill_ids"] == ["approved-audit_planner"]
+    reverse = result["agent_state"]["identity_map"]["reverse"]
+    assert [reverse[value] for value in history["approved_skill_ids"]] == ["approved-audit_planner"]
     assert "not_current_evidence_or_decisions" in history["history_scope"]
     payload = json.loads(client.calls[1]["messages"][1]["content"].split("<audit_data>")[1].split("</audit_data>")[0])
     assert "learning_context" not in payload
-    assert [skill["skill_key"] for skill in payload["active_skills"]] == ["approved-evidence_worker"]
+    assert [reverse[skill["skill_key"]] for skill in payload["active_skills"]] == ["approved-evidence_worker"]
     assert payload["active_skills"][0]["content"]["guidance"] == ["依据本期日期证据"]
     assert payload["deterministic_candidates"][0]["evidence"]["source_evidence"] == "CURRENT_KERNEL_EVIDENCE"
     final = json.loads(client.calls[2]["messages"][1]["content"].split("<agent_results>")[1].split("</agent_results>")[0])

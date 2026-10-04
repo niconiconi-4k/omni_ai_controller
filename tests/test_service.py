@@ -794,7 +794,8 @@ def test_internal_agentic_output_limit_returns_partial_result_instead_of_502() -
         assert response.json()["error_code"] == "agentic_output_limit"
         assert response.json()["result"]["decisions"] == []
         assert len(response.json()["steps"]) == 2
-        assert response.json()["agent_state"]["audit_id"] == "audit-output-limit"
+        state = response.json()["agent_state"]
+        assert state["version"] == 2 and state["identity_map"]["reverse"][state["audit_id"]] == "audit-output-limit"
 
 
 def test_internal_agentic_failure_returns_notebooks_without_changing_detail_contract() -> None:
@@ -815,7 +816,8 @@ def test_internal_agentic_failure_returns_notebooks_without_changing_detail_cont
         assert response.status_code == 502
         payload = response.json()
         assert isinstance(payload["detail"], str) and "返回格式无效" in payload["detail"]
-        assert payload["agent_state"]["audit_id"] == "api-failed"
+        state = payload["agent_state"]
+        assert state["version"] == 2 and state["identity_map"]["reverse"][state["audit_id"]] == "api-failed"
         assert payload["agent_state"]["notebooks"]["evidence_worker"]["entries"]
         assert payload["agent_state"]["task_lists"]["evidence_worker"][0]["status"] == "failed"
         assert len(payload["steps"]) == 1

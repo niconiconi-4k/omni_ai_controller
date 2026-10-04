@@ -99,10 +99,10 @@ def test_cache_index_keeps_count_fields_complete_dates_unknown_and_eight_mib():
         assert book["used_bytes"] == len(canonical_bytes(book)) <= MAX_NOTEBOOK_BYTES
         basics = [e["content"] for e in book["entries"] if e["kind"] == "source_basic"]
         assert all(b["cashflow_lane"] == "out" and b["signed_cashflow_amount"] == "-100" for b in basics)
-        receipt = next(b for b in basics if b["id"] == "r")
+        receipt = next(b for b in basics if books.codec.decode(b["id"], text=False) == "r")
         assert receipt["event_date"] == "" and receipt["financial_facts"]["amount_components"] == components
         index = next(e["content"] for e in book["entries"] if e["kind"] == "source_index")
-        assert [i["id"] for i in index] == ["t", "r"]
+        assert [books.codec.decode(i["id"], text=False) for i in index] == ["t", "r"]
         assert all(i["cashflow_lane"] == "out" and i["signed_cashflow_amount"] == "-100" for i in index)
     assert inventory == original
 

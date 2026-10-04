@@ -32,7 +32,7 @@ def test_complete_utf8_notebook_has_hard_8mb_cap_with_eviction_and_overflow(owne
     assert notebooks.put(owner, "second", "derivative", source["raw"])
     notebook = notebooks.snapshot()["notebooks"][owner]
     assert notebook["evicted_entries"] == 1
-    assert [entry["key"] for entry in notebook["entries"]] == ["second"]
+    assert [entry["key"] for entry in notebook["entries"]] == [notebooks.codec.reference("second", "B")]
     assert not notebooks.put(owner, "oversized", "derivative", "中文" * 1500000)
     notebook = notebooks.snapshot()["notebooks"][owner]
     document = serialized(notebook)
@@ -71,7 +71,7 @@ def test_cache_uses_unchanged_source_only_and_invalidates_all_projections():
     assert notebooks.snapshot()["stats"]["cache_hits"] == 1
     changed = {**receipt, "amount": 900, "party": "B"}
     assert notebooks.facts(changed)["amount"] == 900
-    assert not any(entry["key"] == "receipt:r1:details" for entry in notebooks.snapshot()["notebooks"]["evidence_worker"]["entries"])
+    assert not any(entry["key"] == "receipt:r1:details" for entry in notebooks.internal_snapshot()["notebooks"]["evidence_worker"]["entries"])
     assert notebooks.facts(changed, details=True)["party"] == "B"
     assert notebooks.snapshot()["stats"]["invalidations"] == 1
 

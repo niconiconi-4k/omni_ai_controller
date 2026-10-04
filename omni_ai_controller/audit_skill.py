@@ -6,6 +6,7 @@ from typing import Any
 
 from .client import ModelServerClient, ServerRequestError
 from .config import ConfigurationError
+from .audit_references import ShortReferenceCodec
 
 
 # Compatibility name only; model transport now owns bounded FIFO admission.
@@ -95,17 +96,20 @@ def analyze_audit(
     audit_id: str,
     context: dict[str, Any],
 ) -> dict[str, Any]:
-    document = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+    codec = ShortReferenceCodec((context.get("_agent_state") or {}).get("identity_map"))
+    codec.seed(context)
+    short_audit_id = codec.reference(audit_id, "A")
+    document = json.dumps(codec.encode(context), ensure_ascii=False, separators=(",", ":"))
     if len(document) > MAX_AUDIT_CONTEXT_CHARS:
         raise AuditSkillError("审计候选上下文超过本地模型安全预算，请先进一步分组")
     try:
         with AUDIT_SKILL_LOCK:
             result = client.chat_json(
                 [
-                    {"role": "system", "content": AUDIT_SKILL_SYSTEM_PROMPT},
+                    {"role": "system", "content": codec.text(AUDIT_SKILL_SYSTEM_PROMPT)},
                     {
                         "role": "user",
-                        "content": f"审计编号：{audit_id}\n请复核以下候选：\n<audit_data>{document}</audit_data>",
+                        "content": f"审计编号：{short_audit_id}\n请复核以下候选：\n<audit_data>{document}</audit_data>",
                     },
                 ],
                 schema_name="local_audit_reconciliation",
@@ -122,7 +126,7 @@ def analyze_audit(
     return {
         "request_id": str(raw.get("id") or "") or None,
         "model": client.config.model_name,
-        "result": parsed,
+        "result": codec.model_result(parsed),
         "usage": usage,
         "context_characters": len(document),
         "serialized": True,

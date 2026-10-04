@@ -6,6 +6,7 @@ from contextvars import copy_context
 from copy import deepcopy
 import json
 import os
+import re
 from threading import Lock
 from datetime import datetime, timezone
 from time import time
@@ -23,6 +24,7 @@ from .audit_notebooks import (
     event_date, fingerprint,
 )
 from .audit_inventory import SEED_OBJECTIVES, cashflow_facts, cashflow_sort_key, partition_cashflow
+from .audit_references import ShortReferenceCodec
 
 
 SEED_PLAYBOOK_ID = "accounting-expense-first-v1"
@@ -97,7 +99,7 @@ def _alias_series(prefix: str, values: list[str]) -> tuple[dict[str, str], dict[
     return forward, reverse
 
 
-def _id_aliases(context: dict[str, Any]) -> dict[str, dict[str, str]]:
+def _id_aliases(context: dict[str, Any], codec: ShortReferenceCodec | None = None) -> dict[str, Any]:
     transaction_ids: list[str] = []
     receipt_ids: list[str] = []
 
@@ -127,8 +129,16 @@ def _id_aliases(context: dict[str, Any]) -> dict[str, dict[str, str]]:
     if not inventory:
         transaction_ids.sort()
         receipt_ids.sort()
-    tx_forward, tx_reverse = _alias_series("T", transaction_ids)
-    receipt_forward, receipt_reverse = _alias_series("R", receipt_ids)
+    codec = codec or ShortReferenceCodec()
+    codec.seed(context)
+    for value in transaction_ids:
+        codec.reference(value, "T")
+    for value in receipt_ids:
+        codec.reference(value, "R")
+    tx_forward = {value: codec.reference(value, "T") for value in transaction_ids}
+    tx_reverse = {token: value for value, token in tx_forward.items()}
+    receipt_forward = {value: codec.reference(value, "R") for value in receipt_ids}
+    receipt_reverse = {token: value for value, token in receipt_forward.items()}
     return {
         "tx_forward": tx_forward,
         "tx_reverse": tx_reverse,
@@ -854,18 +864,23 @@ def _candidate_units(candidates: list[dict[str, Any]]) -> list[list[dict[str, An
 def _worker_chunks(context: dict[str, Any]) -> list[dict[str, Any]]:
     excluded_transactions, excluded_receipts = confirmed_ids(context)
     inventory = context.get("source_inventory") or {}
-    inventory_transactions = {str(item["id"]): item for item in inventory.get("transactions") or []}
-    inventory_receipts = {str(item["id"]): item for item in inventory.get("receipts") or []}
+    inventory_sources = {
+        plural: {str(item["id"]): item for item in inventory.get(plural) or []
+                 if isinstance(item, dict) and item.get("id")}
+        for plural in ("transactions", "receipts")
+    }
+    inventory_transactions = inventory_sources["transactions"]
+    inventory_receipts = inventory_sources["receipts"]
     detail_excerpts = {str(item["id"]): {key: item[key] for key in ("ocr_excerpt", "text_excerpt") if key in item}
                        for item in context.get("receipts") or [] if isinstance(item, dict) and item.get("id")}
     transactions = {
         str(item.get("id")): inventory_transactions.get(str(item.get("id")), item)
-        for item in (context.get("transactions") or [])
+        for item in (context.get("transactions", list(inventory_transactions.values())) or [])
         if isinstance(item, dict) and item.get("id")
     }
     receipts = {
         str(item.get("id")): inventory_receipts.get(str(item.get("id")), item)
-        for item in (context.get("receipts") or [])
+        for item in (context.get("receipts", list(inventory_receipts.values())) or [])
         if isinstance(item, dict) and item.get("id")
     }
     eligible: list[dict[str, Any]] = []
@@ -1010,7 +1025,19 @@ def _request_agent(
     steps: list[dict[str, Any]],
     decision_count: int = 1,
     attempts: int = 2,
+    codec: ShortReferenceCodec | None = None,
 ) -> tuple[Any, dict[str, Any]]:
+    if codec is not None:
+        system_prompt = codec.text(system_prompt)
+        # Sanitize the complete nested JSON envelope, including typed non-UUID
+        # identifiers. Word substitution must not change financial prose.
+        def project(match: Any) -> str:
+            payload = json.loads(match.group(2))
+            return f"<{match.group(1)}>" + _serialized(codec.encode(payload)) + f"</{match.group(1)}>"
+        user_prompt = re.sub(r"<(audit_data|audit_summary|agent_results)>(.*)</\1>", project, user_prompt, flags=re.DOTALL)
+        user_prompt = re.sub(r"(?m)^审计编号：([^\n]+)",
+                             lambda match: "审计编号：" + codec.reference(match.group(1), "A"), user_prompt)
+        user_prompt = codec.text(user_prompt)
     bounded_schema = _bounded_output_schema(schema, decision_count)
     for attempt in range(attempts):
         if _cancelled(run_id):
@@ -1085,7 +1112,7 @@ def _request_agent(
                 raise
         else:
             _publish_progress(run_id, recovery=None)
-            return response, result
+            return response, codec.model_result(result) if codec is not None else result
     raise AssertionError("Unreachable retry state")
 
 
@@ -1625,7 +1652,7 @@ def _analyze_agentic_audit(
     notebooks: AuditNotebooks,
 ) -> dict[str, Any]:
     document = _source_document(context)
-    aliases = _id_aliases(context)
+    aliases = _id_aliases(context, notebooks.codec)
     if len(document) > MAX_AGENTIC_SOURCE_CHARS:
         raise AuditSkillError("审计候选资料超过智能流程工作预算，请先进一步筛选")
     chunks = _worker_chunks(context)
@@ -1664,7 +1691,7 @@ def _analyze_agentic_audit(
         return all(states.get(dependency) == "completed" for task in chunk["tasks"] for dependency in task["depends_on"])
 
     def finish_parent(chunk: dict[str, Any]) -> None:
-        snapshot = notebooks.snapshot()
+        snapshot = notebooks.internal_snapshot()
         for parent in {task["parent_task_id"] for task in chunk["tasks"]}:
             jobs = [task for part in chunks for task in part["tasks"] if task["parent_task_id"] == parent]
             approvals = {item["task_id"]: item["status"] for item in snapshot["task_lists"]["audit_planner"]}
@@ -1712,13 +1739,14 @@ def _analyze_agentic_audit(
                 schema=_PLAN_SCHEMA,
                 max_tokens=3072,
                 stage="李师傅制定计划", step_kind="initial_plan", run_id=run_id, steps=steps,
+                codec=notebooks.codec,
             )
             plan = _plan_to_real(plan_raw, aliases)
             chunks = _scoped_jobs(plan, context, notebooks)
             notebooks.put("audit_planner", "plan:" + str((context.get("iteration") or {}).get("number", 1)), "plan", plan)
             current_task_ids = {task["task_id"] for task in plan["tasks"]}
             incomplete_batches.extend("任务依赖无法执行：" + item["task_id"] for item in
-                                      notebooks.snapshot()["task_lists"]["audit_planner"]
+                                      notebooks.internal_snapshot()["task_lists"]["audit_planner"]
                                       if item["status"] == "blocked" and item["task_id"] in current_task_ids)
             _publish_progress(run_id, batch_count=len(chunks))
             _record_step(steps, run_id, {
@@ -1828,6 +1856,7 @@ def _analyze_agentic_audit(
                             max_tokens=min(6144, 2048 + len(chunk["deterministic_candidates"]) * 384),
                             stage="马师傅证据核对", step_kind="evidence_review", run_id=run_id, steps=steps,
                             decision_count=len(chunk["deterministic_candidates"]), attempts=1 if multi_transaction else 2,
+                            codec=notebooks.codec,
                         )
                     except _AgentOutputLimit as exc:
                         if not recover_chunk(chunk, batch_index, exc):
@@ -1873,6 +1902,7 @@ def _analyze_agentic_audit(
                         stage="李师傅最终评估", step_kind="final_assessment", run_id=run_id, steps=steps,
                         decision_count=len(chunk["deterministic_candidates"]),
                         attempts=1 if multi_transaction else 2,
+                        codec=notebooks.codec,
                     )
                 except _AgentOutputLimit as exc:
                     if not recover_chunk(chunk, batch_index, exc):
@@ -1976,7 +2006,8 @@ def analyze_agentic_audit(
         context["_agent_state"] = state
         _publish_progress(run_id, agent_state=state)
 
-    notebooks = AuditNotebooks(audit_id, run_id, context.get("_agent_state"), publish_state)
+    notebooks = AuditNotebooks(audit_id, run_id, context.get("_agent_state"), publish_state,
+                              source_inventory=context.get("source_inventory"))
     prior_steps = context.get("_prior_steps") or []
     deadline = min(float(context.get("_deadline") or time() + MAX_AGENTIC_SECONDS), time() + MAX_AGENTIC_SECONDS)
     _publish_progress(run_id, status="processing", stage="preparing", cancel_requested=False, deadline=deadline, steps=prior_steps, usage=_combined_usage(prior_steps), iteration=(context.get("iteration") or {}).get("number", 1), error_message=None, last_response={}, recovery=None, incomplete_batches=[], batch=None, batch_count=0)
@@ -2014,7 +2045,7 @@ def analyze_agentic_audit(
         }
         _mark_approval_summary(result["result"])
     except Exception as exc:
-        for owner, tasks in notebooks.snapshot()["task_lists"].items():
+        for owner, tasks in notebooks.internal_snapshot()["task_lists"].items():
             for task in tasks:
                 if task["status"] in ("pending", "preparing", "prepared", "running"):
                     notebooks.task(owner, task, "failed")
@@ -2023,7 +2054,7 @@ def analyze_agentic_audit(
         if isinstance(exc, AuditSkillError):
             raise
         raise AuditSkillError("智能流程任务执行失败；已保全双笔记和完成步骤") from exc
-    for owner, tasks in notebooks.snapshot()["task_lists"].items():
+    for owner, tasks in notebooks.internal_snapshot()["task_lists"].items():
         for task in tasks:
             if task["status"] in ("pending", "preparing", "prepared", "running"):
                 notebooks.task(owner, task, "cancelled" if result.get("error_code") == "agentic_cancelled" else "partial")

@@ -240,7 +240,7 @@ def inventory_task(command: dict[str, Any] | None = None, *, iteration: int = 1)
             "derived_from_task_id": None if command is None else command["task_id"]}
 
 
-def register_inventory(state: dict[str, Any], inventory: dict[str, Any],
+def _register_inventory(state: dict[str, Any], inventory: dict[str, Any],
                        command: dict[str, Any] | None = None, *, iteration: int = 1) -> None:
     """Register all sources, including confirmed IDs, without touching decisions."""
     sources = [(kind, source) for plural, kind in (("transactions", "transaction"), ("receipts", "receipt"))
@@ -317,3 +317,26 @@ def register_inventory(state: dict[str, Any], inventory: dict[str, Any],
                 tasks.remove(removable)
                 state["stats"]["task_evictions"] = state["stats"].get("task_evictions", 0) + 1
             tasks.append(task)
+
+
+def register_inventory(state: dict[str, Any], inventory: dict[str, Any],
+                       command: dict[str, Any] | None = None, *, iteration: int = 1,
+                       codec: Any = None) -> None:
+    """v2 storage adapter; canonical hashes/algorithm remain identical to v1.
+
+    Main's mirrored implementation must adopt the same boundary adapter, not
+    hash short projections (which would break financial cache validation).
+    """
+    from .audit_references import ShortReferenceCodec, REFERENCE_SCHEMA
+    codec = codec or ShortReferenceCodec(state.get("identity_map"))
+    codec.seed({"source_inventory": inventory})
+    internal = {**state, "notebooks": codec.decode(state["notebooks"]) if state.get("version") == 2 else deepcopy(state["notebooks"]),
+                "task_lists": codec.decode(state["task_lists"]) if state.get("version") == 2 else deepcopy(state["task_lists"])}
+    _register_inventory(internal, inventory, command, iteration=iteration)
+    state.update(version=2, reference_schema=REFERENCE_SCHEMA, identity_map=codec.identity_map,
+                 notebooks=codec.encode(internal["notebooks"], storage=True), task_lists=codec.encode(internal["task_lists"], storage=True))
+    for book in state["notebooks"].values():
+        fit_book(book)
+    for field, prefix in (("audit_id", "A"), ("run_id", "N")):
+        if state.get(field):
+            state[field] = codec.reference(state[field], prefix, encoded=True)
