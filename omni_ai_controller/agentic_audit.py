@@ -51,7 +51,7 @@ MAX_PLANNER_INPUT_TOKENS, MAX_WORKER_CHUNK_TOKENS, MAX_AGENT_INPUT_TOKENS = _aud
 )
 MAX_WORKER_CHUNK_CANDIDATES = 4
 MAX_WORKER_CHUNK_TRANSACTIONS = 2
-MAX_CHANNEL_GROUP_TRANSACTIONS = 4  # One indivisible group, not a global batch increase.
+MAX_CHANNEL_GROUP_TRANSACTIONS = 256  # One indivisible group, not a global batch increase.
 MAX_AGENTIC_CHUNKS = 128
 MAX_AGENT_RETRY_OUTPUT_TOKENS = 8192
 MAX_AGENT_STEP_SECONDS = 240
@@ -613,7 +613,7 @@ _FINAL_SYSTEM_PROMPT = """你是审计指挥智能体“李师傅”，现在评
 所有流水/小票 ID 使用输入中的紧凑编号（T001…/R001…），不要输出原始长 ID。只返回符合 JSON Schema 的对象。"""
 
 _PAYMENT_CHANNEL_RULE = """通用支付通道规则：只评估内核提供的完整 income_payment_channel 组。
-group_transaction_ids/group_row_count 是实际银行行数（2至4），不是卡支付客户笔数；聚合卡入账可为1行，Swish可为最多3行。
+group_transaction_ids/group_row_count 是实际银行行数（2至256），不是卡支付客户笔数；聚合卡入账可为1行，Swish 笔数必须与票面括号计数一致。
 显式通道金额和笔数、聚合银行金额、相邻实际时间及全局唯一完整分配联合构成证明；手机号仅是联合提示，门店名称不能单独证明支付渠道。
 内核确认的0至3日结算延迟或局部时间重排无需逐项解释税费、费率及其他差额构成；不能自行重排或重算。
 同组银行行可共用同一原始子票，这不是重复凭证；必须覆盖原始完整子票集合和全部银行行，不能省略、拆组、跨组或混合 match/suggest。

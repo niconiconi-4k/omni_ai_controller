@@ -54,7 +54,7 @@ def single(tx, lane, category="expense", role="direct_expense"):
             "deterministic_candidates": [{"transaction_id": tx, "receipt_upload_id": "r-" + tx, "allocation_role": role}]}
 
 
-@pytest.mark.parametrize("count", [2, 3, 4])
+@pytest.mark.parametrize("count", [2, 3, 4, 12])
 def test_complete_channel_bank_rows_are_one_indivisible_budgeted_chunk(count):
     context = channel_context(count)
     before = deepcopy(context)
@@ -69,6 +69,11 @@ def test_complete_channel_bank_rows_are_one_indivisible_budgeted_chunk(count):
     assert agent._validate_response(final, worker, chunks[0], used_receipts, used_transactions) == final["decisions"]
     assert used_receipts == {"original:0"}
     assert len(used_transactions) == count
+
+
+def test_controller_accepts_256_member_group_and_rejects_257():
+    assert agent._complete_channel_group(channel_context(256)["deterministic_candidates"])
+    assert not agent._complete_channel_group(channel_context(257)["deterministic_candidates"])
 
 
 def test_channel_role_routes_to_revenue_not_direct_expenses():
@@ -154,7 +159,7 @@ def test_final_channel_approval_is_all_or_nothing(fault):
 @pytest.mark.parametrize("fault", ["missing_member", "wrong_count", "wrong_declared_ids", "missing_group", "different_child", "missing_atomic",
                                     "wrong_method", "duplicate_bank", "too_many"])
 def test_malformed_or_oversized_channel_group_does_not_drop_other_valid_chunks(fault):
-    bad = channel_context(5 if fault == "too_many" else 4)
+    bad = channel_context(257 if fault == "too_many" else 4)
     rows = bad["deterministic_candidates"]
     if fault == "missing_member":
         rows.pop()
