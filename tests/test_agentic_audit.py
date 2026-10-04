@@ -331,11 +331,19 @@ def test_truncated_batch_splits_only_between_transactions(stage: str) -> None:
 
 def test_failed_single_group_does_not_discard_other_approved_batches(monkeypatch) -> None:
     monkeypatch.setattr("omni_ai_controller.agentic_audit.MAX_WORKER_CHUNK_CANDIDATES", 1)
-    approved = {**_final(), "decisions": [{"transaction_id": "tx-1", "recommendation": "suggest"}]}
-    client = FakeClient([_plan(), _worker(), approved, "{truncated", "{truncated"], length_calls={4, 5})
+    # A suggestion must reference a legal covered relation, not reserve a bare TX.
+    approved = {**_final(), "decisions": [{"transaction_id": "tx-1", "receipt_upload_ids": ["receipt-0"],
+                                          "recommendation": "suggest", "confidence": .7}]}
+    worker = {**_worker(), "observations": [{
+        "transaction_id": "tx-1", "receipt_upload_ids": ["receipt-0"], "group_id": None,
+        "finding": "候选待复核", "evidence": ["合法内核候选"], "unresolved": ["仍需消歧"],
+    }]}
+    client = FakeClient([_plan(), worker, approved, "{truncated", "{truncated"], length_calls={4, 5})
     result = analyze_agentic_audit(client, audit_id="partial-batches", context=_grouped_context())
     assert result["error_code"] == "agentic_output_limit"
     assert result["result"]["decisions"] == approved["decisions"]
+    assert result["result"]["approval_diagnostics"]["approved_suggest_count"] == 1
+    assert result["result"]["approval_diagnostics"]["approved_match_count"] == 0
     assert result["result"]["risks"]
     assert len(client.calls) == 5
     assert result["usage"]["total_tokens"] == 1650

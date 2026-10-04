@@ -59,6 +59,30 @@ MAX_AGENTIC_SECONDS = 2400
 MAX_LEARNING_PROMPT_BYTES = 2_048
 MAX_SKILL_PROMPT_BYTES = 6_000
 MAX_SKILL_ITEM_BYTES = 2_000
+MAX_APPROVAL_REJECTIONS = 64
+MAX_APPROVAL_DETAIL_CHARS = 1_000
+
+
+_APPROVAL_REASONS = {
+    "invalid_decision": "决策格式或 recommendation 非法，不能进入分配。",
+    "invalid_receipt_ids": "凭证 ID 集合非法、重复或与完整组不一致。",
+    "outside_scope": "交易不在本次合法内核 scope 内。",
+    "not_kernel_candidate": "不是内核提供的完整候选关系，不能进入分配。",
+    "resource_conflict": "交易或凭证已被占用，不能重复分配。",
+    "incomplete_channel_group": "支付通道内核组不完整，不能确认半组。",
+    "incomplete_group_decisions": "模型未完整且唯一覆盖组内全部流水。",
+    "mixed_group_recommendations": "同组 match/suggest 等意向不一致，整组拒绝。",
+    "missing_worker_coverage": "缺少合法、完整且同组的 worker observation。",
+    "unknown_cashflow": "经济方向未知或流水与凭证方向不一致。",
+    "unknown_currency": "源事实明确标记币种未知或无效，不能确认。",
+    "currency_conflict": "流水与凭证币种存在明确冲突。",
+    "kernel_confirmation_blocked": "内核明确阻止自动确认或存在全局歧义/证据冲突。",
+    "unproven_channel_group": "支付通道缺少全局唯一完整证明。",
+    "confidence_below_threshold": "李师傅 confidence 必须是 0.88 至 1 的有效数值。",
+    "worker_unresolved": "worker unresolved 非空；保留原文，不能以摘要或关键词绕过。",
+    "missing_worker_evidence": "worker finding 或有效 evidence 缺失。",
+    "empty_match_receipts": "match 没有完整凭证集合。",
+}
 
 
 def _alias_series(prefix: str, values: list[str]) -> tuple[dict[str, str], dict[str, str]]:
@@ -586,6 +610,13 @@ group_transaction_ids/group_row_count 是实际银行行数（2至4），不是�
 未知方向或通道、内核 automatic_confirmation_blocked、非全局唯一或缺失完整证明的组只能整组建议，不能自动确认。"""
 _WORKER_SYSTEM_PROMPT += "\n" + _PAYMENT_CHANNEL_RULE
 _FINAL_SYSTEM_PROMPT += "\n" + _PAYMENT_CHANNEL_RULE
+
+_INCOME_IDENTITY_RULE = """收入关系核对不是差额归因审计：公司金额容差及真实活动后0至3天结算窗以内，未逐项解释手续费、税费、分成或其他差额，本身仅是披露风险，写入 finding/evidence/risks，不是身份阻塞，不写入 unresolved。
+POS商户与银行PSP/支付结算方名称不必相同；仅名称不同或未确认结算方名称语义，不足以要求身份复核。只有独立证据表明非该收入、实际日期不可能、金额超公司容差、未知经济方向/未知币种或币种冲突、真实全局同等方案、重复占用、半组或证据冲突，才构成关系阻塞，并具体指出证据。
+不得以本分片排序替代全局证明，不得忽略真实 unresolved；内核已 verified/confirmed 的关系由服务端保留并排除，不需再次由模型批准，也不得重新分配其资源。
+summary 是模型评估文字，不是实际保存的批准结果；只有完整 decisions 通过服务端 scope、covered 关系和硬证据门槛才算批准，不能用“确认Txxx/Rxxx”文字代替 decisions。"""
+_WORKER_SYSTEM_PROMPT += "\n" + _INCOME_IDENTITY_RULE
+_FINAL_SYSTEM_PROMPT += "\n" + _INCOME_IDENTITY_RULE
 
 
 def _planner_inventory_summary(context: dict[str, Any]) -> dict[str, Any]:
@@ -1155,7 +1186,11 @@ def _worker_evidence(worker: dict[str, Any], chunk: dict[str, Any]) -> dict[str,
 
 def _approved_decisions(final: dict[str, Any], worker: dict[str, Any], chunk: dict[str, Any],
                         used_receipts: set[str] | None = None, used_transactions: set[str] | None = None) -> list[dict[str, Any]]:
-    """All recommendations are constrained; only Li can approve at >= .88."""
+    """Approve explicit decisions only; rejected intentions never allocate/freeze.
+
+    Diagnostics are server-generated, bounded and use already restored real IDs.
+    No model-supplied diagnostics or prose can authorize a relation.
+    """
     used_receipts = used_receipts if used_receipts is not None else set()
     used_transactions = used_transactions if used_transactions is not None else set()
     allowed = {(tx, ids) for tx, ids, _ in _kernel_relations(chunk)}
@@ -1164,68 +1199,194 @@ def _approved_decisions(final: dict[str, Any], worker: dict[str, Any], chunk: di
                for item in observations}
     transactions = {tx for tx, _ in allowed}
     result = []
+    rejected = []
+    reason_counts: Counter[str] = Counter()
+    rejected_count = 0
+
+    def reject(items: list[Any], codes: list[str], group_id: str | None = None) -> None:
+        nonlocal rejected_count
+        codes = list(dict.fromkeys(codes))
+        for item in items:
+            rejected_count += 1
+            reason_counts.update(codes)
+            if len(rejected) >= MAX_APPROVAL_REJECTIONS:
+                continue
+            item = item if isinstance(item, dict) else {}
+            raw_ids = item.get("receipt_upload_ids")
+            ids = raw_ids if isinstance(raw_ids, list) else []
+            tx = item.get("transaction_id")
+            observation = covered.get((str(tx or ""), frozenset(value for value in ids if isinstance(value, str)))) or {}
+            confidence = item.get("confidence")
+            rejected.append({
+                "transaction_id": tx if isinstance(tx, str) else None,
+                "receipt_upload_ids": [value for value in ids[:64] if isinstance(value, str)],
+                "receipt_upload_ids_omitted": max(0, len(ids) - 64),
+                "group_id": group_id or observation.get("group_id"),
+                "model_recommendation": str(item.get("recommendation") or "")[:64],
+                "model_confidence": confidence if (isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+                                                   and confidence == confidence and confidence not in (float("inf"), -float("inf"))) else None,
+                "model_explanation": str(item.get("explanation") or "")[:MAX_APPROVAL_DETAIL_CHARS],
+                "reason_code": codes[0], "reason_codes": codes,
+                "explanation": "；".join(_APPROVAL_REASONS[code] for code in codes),
+                "worker_unresolved": [value[:MAX_APPROVAL_DETAIL_CHARS] for value in (observation.get("unresolved") or [])[:8]],
+                "worker_unresolved_omitted": max(0, len(observation.get("unresolved") or []) - 8),
+                "disposition": "rejected",  # Display-only, never an allocation suggestion.
+            })
+
     channel_groups = _channel_groups(chunk["deterministic_candidates"])
     channel_transactions = {str(item["transaction_id"]) for members in channel_groups.values() for item in members}
     decisions = [item for item in final.get("decisions") or [] if isinstance(item, dict)]
+    membership = Counter(tx for members in channel_groups.values()
+                         for tx in {str(item["transaction_id"]) for item in members})
+    ambiguous_transactions = set().union(*(set(str(item["transaction_id"]) for item in members)
+                                           for members in channel_groups.values()
+                                           if any(membership[str(item["transaction_id"])] > 1 for item in members)))
+    # Competing complete groups are not resolved by model order. Count each
+    # rejected intention once, and do not confirm the remaining half of a group.
+    reject([item for item in decisions if str(item.get("transaction_id") or "") in ambiguous_transactions],
+           ["kernel_confirmation_blocked"])
     for members in channel_groups.values():
-        if not _complete_channel_group(members):
-            continue
         txs = {str(item["transaction_id"]) for item in members}
-        ids = frozenset(candidate_receipts(members[0]))
+        if txs & ambiguous_transactions:
+            continue
         selected = [item for item in decisions if str(item.get("transaction_id") or "") in txs]
-        if (len(selected) != len(txs) or {str(item.get("transaction_id")) for item in selected} != txs
-                or len({item.get("recommendation") for item in selected}) != 1
-                or txs & used_transactions or ids & used_receipts):
+        group = _group_id(members[0])
+        if not _complete_channel_group(members):
+            reject(selected, ["incomplete_channel_group"], group)
+            continue
+        ids = frozenset(candidate_receipts(members[0]))
+        if len(selected) != len(txs) or {str(item.get("transaction_id")) for item in selected} != txs:
+            reject(selected, ["incomplete_group_decisions"], group)
+            continue
+        if len({str(item.get("recommendation")) for item in selected}) != 1:
+            reject(selected, ["mixed_group_recommendations"], group)
+            continue
+        if txs & used_transactions or ids & used_receipts:
+            reject(selected, ["resource_conflict"], group)
             continue
         recommendation = selected[0].get("recommendation")
         if recommendation not in ("match", "suggest", "leave_unmatched"):
+            reject(selected, ["invalid_decision"], group)
             continue
         if any(not isinstance(item.get("receipt_upload_ids"), list)
                or item["receipt_upload_ids"] != sorted(ids) for item in selected):
+            reject(selected, ["invalid_receipt_ids"], group)
             continue
-        group = _group_id(members[0])
         if any((str(item["transaction_id"]), ids) not in covered
                or covered[(str(item["transaction_id"]), ids)].get("group_id") != group for item in selected):
+            reject(selected, ["missing_worker_coverage"], group)
             continue
         if recommendation == "match":
-            if any(not _relation_cashflow_known(chunk, str(item["transaction_id"]), ids) for item in selected):
-                continue
+            codes = []
             if any(not _channel_proven(item) for item in members):
-                continue
-            if any(not _match_evidence(item, covered[(str(item["transaction_id"]), ids)]) for item in selected):
+                codes.append("unproven_channel_group")
+            for item in selected:
+                codes.extend(_relation_rejection_codes(chunk, str(item["transaction_id"]), ids))
+                codes.extend(_match_rejection_codes(item, covered[(str(item["transaction_id"]), ids)]))
+            if codes:
+                reject(selected, codes, group)
                 continue
         used_transactions.update(txs)
         used_receipts.update(ids)  # Reserve original child once for the entire group.
         result.extend(selected)
     for decision in final.get("decisions") or []:
-        if not isinstance(decision, dict) or decision.get("recommendation") not in ("match", "suggest", "leave_unmatched"):
+        if not isinstance(decision, dict):
+            reject([decision], ["invalid_decision"])
             continue
         tx = str(decision.get("transaction_id") or "")
         if tx in channel_transactions:
             continue  # No single-row fallback for rejected/partial channel groups.
+        if decision.get("recommendation") not in ("match", "suggest", "leave_unmatched"):
+            reject([decision], ["invalid_decision"])
+            continue
         raw_ids = decision.get("receipt_upload_ids") or []
         if not isinstance(raw_ids, list) or not all(isinstance(value, str) for value in raw_ids) or len(set(raw_ids)) != len(raw_ids):
+            reject([decision], ["invalid_receipt_ids"])
             continue
         ids = frozenset(str(value) for value in raw_ids)
-        if tx not in transactions or tx in used_transactions or ids & used_receipts:
+        if tx not in transactions:
+            reject([decision], ["outside_scope"])
             continue
-        if ids and ((tx, ids) not in allowed or (tx, ids) not in covered):
+        if tx in used_transactions or ids & used_receipts:
+            reject([decision], ["resource_conflict"])
+            continue
+        if decision["recommendation"] == "suggest" and not ids:
+            reject([decision], ["not_kernel_candidate"])
+            continue
+        if ids and (tx, ids) not in allowed:
+            reject([decision], ["not_kernel_candidate"])
+            continue
+        if ids and (tx, ids) not in covered:
+            reject([decision], ["missing_worker_coverage"])
             continue
         if decision["recommendation"] == "match":
             observation = covered.get((tx, ids)) or {}
-            if not ids or not _relation_cashflow_known(chunk, tx, ids) or not _match_evidence(decision, observation):
+            codes = (["empty_match_receipts"] if not ids else _relation_rejection_codes(chunk, tx, ids))
+            codes.extend(_match_rejection_codes(decision, observation))
+            if codes:
+                reject([decision], codes)
                 continue
         used_transactions.add(tx)
         used_receipts.update(ids)
         result.append(decision)
+    final["rejected_decisions"] = rejected
+    final["approval_diagnostics"] = {
+        "requested_count": len(final.get("decisions") or []),
+        "approved_count": len(result),
+        "approved_match_count": sum(item["recommendation"] == "match" for item in result),
+        "approved_suggest_count": sum(item["recommendation"] == "suggest" for item in result),
+        "approved_leave_unmatched_count": sum(item["recommendation"] == "leave_unmatched" for item in result),
+        "rejected_count": rejected_count, "rejection_counts": dict(reason_counts),
+        "rejected_decisions_omitted": rejected_count - len(rejected),
+    }
     return result
 
 
 def _match_evidence(decision: dict[str, Any], observation: dict[str, Any]) -> bool:
+    return not _match_rejection_codes(decision, observation)
+
+
+def _match_rejection_codes(decision: dict[str, Any], observation: dict[str, Any]) -> list[str]:
     confidence = decision.get("confidence")
-    return (isinstance(confidence, (float, int)) and not isinstance(confidence, bool)
-            and .88 <= confidence <= 1 and not observation.get("unresolved")
-            and bool(observation.get("finding")) and any(observation.get("evidence") or []))
+    codes = []
+    if not (isinstance(confidence, (float, int)) and not isinstance(confidence, bool) and .88 <= confidence <= 1):
+        codes.append("confidence_below_threshold")
+    if observation.get("unresolved"):
+        codes.append("worker_unresolved")
+    if not observation.get("finding") or not any(observation.get("evidence") or []):
+        codes.append("missing_worker_evidence")
+    return codes
+
+
+def _relation_rejection_codes(chunk: dict[str, Any], tx: str, ids: frozenset[str]) -> list[str]:
+    codes = []
+    if not _relation_cashflow_known(chunk, tx, ids):
+        codes.append("unknown_cashflow")
+    transaction = next((item for item in chunk.get("transactions") or [] if str(item.get("id")) == tx), {})
+    receipt_facts = [item for item in chunk.get("receipts") or [] if str(item.get("id")) in ids]
+    # Legacy compact facts may omit currency entirely; never turn an explicit
+    # unknown currency into a confirmation by relying on the model's prose.
+    if any("currency" in item and (len(str(item.get("currency") or "").strip()) != 3
+                                  or not str(item.get("currency") or "").strip().isascii()
+                                  or not str(item.get("currency") or "").strip().isalpha())
+           for item in [transaction, *receipt_facts]):
+        codes.append("unknown_currency")
+    currency = str(transaction.get("currency") or "").strip().upper()
+    if currency and any(str(item.get("currency") or "").strip().upper() not in ("", currency)
+                        for item in receipt_facts):
+        codes.append("currency_conflict")
+    for candidate in chunk.get("deterministic_candidates") or []:
+        if str(candidate.get("transaction_id")) != tx or not candidate_receipts(candidate) <= ids:
+            continue
+        evidence = candidate.get("evidence") or {}
+        if not isinstance(evidence, dict):
+            continue
+        sequence = evidence.get("income_sequence") or {}
+        proofs = [evidence, sequence] if isinstance(sequence, dict) else [evidence]
+        if any(proof.get("automatic_confirmation_blocked") is True
+               or proof.get("globally_unambiguous") is False for proof in proofs):
+            codes.append("kernel_confirmation_blocked")
+    return list(dict.fromkeys(codes))
 
 
 def _relation_cashflow_known(chunk: dict[str, Any], tx: str, ids: frozenset[str]) -> bool:
@@ -1420,6 +1581,40 @@ def _final_prompts(audit_id: str, summary: dict[str, Any], chunk: dict[str, Any]
 def _validate_response(final: dict[str, Any], worker: dict[str, Any], chunk: dict[str, Any],
                        used_receipts: set[str], used_transactions: set[str]) -> list[dict[str, Any]]:
     return _approved_decisions(final, worker, chunk, used_receipts, used_transactions)
+
+
+def _combined_approval_diagnostics(assessments: list[dict[str, Any]]) -> dict[str, Any]:
+    rejected: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter({key: 0 for key in (
+        "requested_count", "approved_count", "approved_match_count", "approved_suggest_count",
+        "approved_leave_unmatched_count", "rejected_count",
+    )})
+    reasons: Counter[str] = Counter()
+    for assessment in assessments:
+        diagnostics = assessment.get("approval_diagnostics") or {}
+        for key in ("requested_count", "approved_count", "approved_match_count", "approved_suggest_count",
+                    "approved_leave_unmatched_count", "rejected_count"):
+            counts[key] += diagnostics.get(key, 0)
+        reasons.update(diagnostics.get("rejection_counts") or {})
+        rejected.extend((assessment.get("rejected_decisions") or [])[:MAX_APPROVAL_REJECTIONS - len(rejected)])
+    return {
+        "rejected_decisions": rejected,
+        "approval_diagnostics": {**counts, "rejection_counts": dict(reasons),
+                                 "rejected_decisions_omitted": counts["rejected_count"] - len(rejected)},
+    }
+
+
+def _mark_approval_summary(final: dict[str, Any]) -> None:
+    """Post-inference display only: neither decisions nor token usage are inferred."""
+    final["model_summary"] = str(final.get("summary") or "")
+    diagnostics = final["approval_diagnostics"]
+    reasons = "、".join(f"{code}={count}" for code, count in diagnostics["rejection_counts"].items())
+    final["summary"] = (
+        f"实际审批：确认 {diagnostics['approved_match_count']} 条，建议 {diagnostics['approved_suggest_count']} 条，"
+        f"保留未匹配 {diagnostics['approved_leave_unmatched_count']} 条，拒绝 {diagnostics['rejected_count']} 条意向。"
+        + (f"拒绝原因：{reasons}；详见 rejected_decisions/approval_diagnostics。" if reasons else "")
+        + "模型评估文字（非实际审批结果）：" + final["model_summary"]
+    )
 
 
 def _analyze_agentic_audit(
@@ -1685,6 +1880,7 @@ def _analyze_agentic_audit(
                     continue
                 final = _final_to_real(final_raw, aliases)
                 final["decisions"] = _validate_response(final, worker, chunk, used_receipts, used_transactions)
+                _mark_approval_summary(final)
                 for decision in final["decisions"]:
                     if decision["recommendation"] == "match":
                         locked_transactions.add(str(decision["transaction_id"]))
@@ -1704,7 +1900,9 @@ def _analyze_agentic_audit(
                 # Decisions stay authoritative in steps, NOT evictable notebooks.
                 notebooks.put("audit_planner", "assessment:" + chunk_key(chunk), "assessment_reference", {
                     "sequence_number": steps[-1]["sequence_number"], "summary": final.get("summary"),
-                    "approved_transaction_ids": [item["transaction_id"] for item in final["decisions"]],
+                    "approved_transaction_ids": [item["transaction_id"] for item in final["decisions"]
+                                                 if item["recommendation"] == "match"],
+                    "approval_diagnostics": final["approval_diagnostics"],
                 })
                 for task in chunk["tasks"]:
                     notebooks.task("audit_planner", approval_task(task), "completed")
@@ -1738,8 +1936,9 @@ def _analyze_agentic_audit(
             for decision in (item.get("decisions") or [])
         ],
         "summary": f"李师傅完成 {len(final_results)}/{len(chunks)} 个证据分片评估。" + "；".join(
-            str(item.get("summary") or "") for item in final_results if item.get("summary")
+            str(item.get("model_summary") or "") for item in final_results if item.get("model_summary")
         ),
+        **_combined_approval_diagnostics(final_results),
         "risks": risks,
         "plan_assessment": "；".join(
             str(item.get("plan_assessment") or "")
@@ -1747,6 +1946,7 @@ def _analyze_agentic_audit(
         ),
         "skill_candidates": skill_candidates,
     }
+    _mark_approval_summary(final)
     return {
         "request_id": steps[-1]["request_id"] if steps else None,
         "model": client.config.model_name,
@@ -1789,6 +1989,9 @@ def analyze_agentic_audit(
         # Initial-plan exhaustion, shared deadline or cancellation. Recover only
         # completed Li approvals; worker observations can never become decisions.
         snapshot = get_audit_progress(run_id)
+        completed_assessments = [step.get("result") or {} for step in snapshot.get("steps") or []
+                     if step.get("status") == "completed" and step.get("step_kind") == "final_assessment"
+                     and (step.get("input_summary") or {}).get("iteration") == (context.get("iteration") or {}).get("number", 1)]
         result = {
             "request_id": None,
             "model": client.config.model_name,
@@ -1800,16 +2003,16 @@ def analyze_agentic_audit(
             "steps": snapshot.get("steps") or [],
             "usage": snapshot.get("usage") or {},
             "result": {
-                "decisions": [decision for step in snapshot.get("steps") or []
-                              if step.get("status") == "completed" and step.get("step_kind") == "final_assessment"
-                              and (step.get("input_summary") or {}).get("iteration") == (context.get("iteration") or {}).get("number", 1)
-                              for decision in (step.get("result") or {}).get("decisions") or []],
-                "summary": "已达到步骤或整体预算，保留已批准分片和确定性候选，剩余需复核。",
+                "decisions": [decision for assessment in completed_assessments for decision in assessment.get("decisions") or []],
+                **_combined_approval_diagnostics(completed_assessments),
+                "summary": "已达到步骤或整体预算，保留已批准分片和确定性候选，剩余需复核。" + "；".join(
+                    str(assessment.get("model_summary") or "") for assessment in completed_assessments),
                 "risks": [str(exc)], "plan_assessment": "按预算保存已完成评估；未完成部分不作确认", "skill_candidates": [],
             },
             "error_code": "agentic_cancelled" if isinstance(exc, _AgentCancelled) else "agentic_iteration_budget" if isinstance(exc, _AgentDeadline) else "agentic_step_timeout" if isinstance(exc, _AgentStepTimeout) else "agentic_output_limit",
             "error_message": str(exc),
         }
+        _mark_approval_summary(result["result"])
     except Exception as exc:
         for owner, tasks in notebooks.snapshot()["task_lists"].items():
             for task in tasks:
